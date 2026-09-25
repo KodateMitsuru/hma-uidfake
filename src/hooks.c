@@ -67,8 +67,26 @@ static void hook_rewrite(struct pt_regs* regs, u32 which_val,
   st->active = 1;
 }
 
+/* Destination for the branchless restore when the wrapped syscall gave us no pt_regs. */
+static struct pt_regs g_scratch_regs;
+
+/*
+ * The restore must not branch on data either: `active` is 0 for the syscalls whose
+ * `which` we do not care about, and that must never turn into a hit-vs-miss branch.
+ * Store unconditionally and pick the value with csel -- `active` 0 means "write the
+ * value that is already there", which for a real pt_regs is a no-op store.
+ */
 static void hook_restore(struct kr_state* st) {
-  if (st->active && st->uregs) st->uregs->regs[ARG_WHO] = st->orig_who;
+  struct pt_regs* dst = st->uregs ? st->uregs : &g_scratch_regs;
+  u32 cur = (u32)dst->regs[ARG_WHO];
+  u32 val;
+
+  asm("cmp\t%w[f], #0\n\tcsel\t%w[v], %w[o], %w[c], ne"
+      : [v] "=r"(val)
+      : [f] "r"((u32)st->active), [o] "r"(st->orig_who), [c] "r"(cur)
+      : "cc");
+
+  dst->regs[ARG_WHO] = val;
 }
 
 #define DEFINE_HOOK(i)                                                        \
