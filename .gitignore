@@ -1,0 +1,10 @@
+# build outputs live in the CMake build directory; these are just safety nets
+*.o
+*.ko
+*.cmd
+*.symversions
+Module.symvers
+modules.order
+build/
+out/
+dist/

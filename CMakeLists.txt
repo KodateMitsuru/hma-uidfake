@@ -1,0 +1,141 @@
+cmake_minimum_required(VERSION 3.20)
+project(hma-uidfake LANGUAGES NONE)
+
+# Usage:
+#   cmake -S . -B build -DUG_NDK=/path/to/ndk
+#   cmake --build build                     # default target: flashable zip
+#   cmake --build build --target ko         # all KMI modules
+#   cmake --build build --target ko-android14-6.1
+#   cmake --build build --target sync-tool
+# Everything is written into build/ only: ko/  tools-build/  dist/
+
+set(DDK_ROOT "/opt/ddk" CACHE PATH "DDK root (provides kdir/ and clang/)")
+set(UG_NDK "" CACHE PATH "Android NDK root")
+
+# KMI -> clang shipped with the DDK. android12-5.10 is absent on purpose: that kernel
+# tree uses GCC global register variables and "Q" constraints, which clang rejects.
+set(UG_KMI_CLANG
+    android13-5.10:clang-r450784e
+    android13-5.15:clang-r450784e
+    android14-5.15:clang-r487747c
+    android14-6.1:clang-r487747c
+    android15-6.6:clang-r510928
+    android16-6.12:clang-r536225
+    android17-6.18:clang-r584948c)
+
+if(NOT UG_NDK)
+  set(UG_NDK "$ENV{ANDROID_NDK_HOME}")
+endif()
+if(NOT UG_NDK)
+  message(FATAL_ERROR "Android NDK required: -DUG_NDK=/path/to/ndk or set ANDROID_NDK_HOME")
+endif()
+
+# module id / version come from module/module.prop
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/module/module.prop" _prop)
+foreach(_l IN LISTS _prop)
+  if(_l MATCHES "^id=(.+)$")
+    set(UG_ID "${CMAKE_MATCH_1}")
+  elseif(_l MATCHES "^version=(.+)$")
+    set(UG_VER "${CMAKE_MATCH_1}")
+  endif()
+endforeach()
+set(KO_NAME hma_uidfake)
+
+set(KO_DIR "${CMAKE_BINARY_DIR}/ko")
+file(MAKE_DIRECTORY "${KO_DIR}")
+file(GLOB SRC_ITEMS "${CMAKE_CURRENT_SOURCE_DIR}/src/*")
+set(SRC_FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/main.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/hooks.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/policy.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/netlink.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/include/uidfake.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/include/kmi_compat.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/Makefile)
+
+if(NOT CMAKE_MAKE_PROGRAM)
+  find_program(CMAKE_MAKE_PROGRAM NAMES make gmake REQUIRED)
+endif()
+
+# Kernel modules must be linked by kbuild (modpost, vermagic, symbol CRCs). kbuild
+# writes its objects into the M= directory, so every KMI builds inside
+# build/kmi/<kmi>/ -- a directory that only holds symlinks to src/. The source tree
+# is therefore never written to, and no copy of it is needed either.
+set(_ko_outputs "")
+foreach(_pair IN LISTS UG_KMI_CLANG)
+  string(REPLACE ":" ";" _p "${_pair}")
+  list(GET _p 0 _kmi)
+  list(GET _p 1 _clang)
+  set(_kdir "${DDK_ROOT}/kdir/${_kmi}")
+  set(_clang_bin "${DDK_ROOT}/clang/${_clang}/bin")
+  set(_stage "${CMAKE_BINARY_DIR}/kmi/${_kmi}")
+  set(_out "${KO_DIR}/${_kmi}_arm64_${KO_NAME}.ko")
+
+  if(NOT EXISTS "${_kdir}" OR NOT EXISTS "${_clang_bin}")
+    message(FATAL_ERROR "missing DDK tree or clang for ${_kmi}: ${_kdir} / ${_clang_bin}")
+  endif()
+
+  file(MAKE_DIRECTORY "${_stage}")
+  foreach(_f IN LISTS SRC_ITEMS)
+    get_filename_component(_name "${_f}" NAME)
+    file(CREATE_LINK "${_f}" "${_stage}/${_name}" SYMBOLIC RESULT _ignored)
+  endforeach()
+
+  add_custom_command(OUTPUT "${_out}"
+    COMMAND ${CMAKE_COMMAND} -E env "PATH=${_clang_bin}:$ENV{PATH}"
+            ${CMAKE_MAKE_PROGRAM} -C ${_kdir} ARCH=arm64 LLVM=1 M=${_stage} modules
+    COMMAND "${_clang_bin}/llvm-strip" -d "${_stage}/${KO_NAME}.ko"
+    COMMAND ${CMAKE_COMMAND} -E copy "${_stage}/${KO_NAME}.ko" "${_out}"
+    DEPENDS ${SRC_FILES}
+    COMMENT "kbuild ${_kmi}"
+    VERBATIM)
+  add_custom_target("ko-${_kmi}" DEPENDS "${_out}")
+  list(APPEND _ko_outputs "${_out}")
+endforeach()
+add_custom_target(ko DEPENDS ${_ko_outputs})
+
+# sync-tool: src/tools is a standalone CMake project, cross compiled with the NDK.
+file(GLOB TOOL_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/tools/*")
+set(UG_TOOLS_BUILD "${CMAKE_BINARY_DIR}/tools-build")
+set(UG_SYNC "${UG_TOOLS_BUILD}/sync-tool")
+# The NDK toolchain restricts find_package to the sysroot by default; nlohmann_json
+# comes from the host distro, so widen the package search scope.
+add_custom_command(OUTPUT "${UG_SYNC}"
+  COMMAND ${CMAKE_COMMAND} -S "${CMAKE_CURRENT_SOURCE_DIR}/src/tools" -B "${UG_TOOLS_BUILD}"
+          -DCMAKE_TOOLCHAIN_FILE=${UG_NDK}/build/cmake/android.toolchain.cmake
+          -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=24 -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH
+  COMMAND ${CMAKE_COMMAND} --build "${UG_TOOLS_BUILD}"
+  DEPENDS ${TOOL_SOURCES}
+  COMMENT "building sync-tool (CMake + NDK)"
+  VERBATIM)
+add_custom_target(sync-tool DEPENDS "${UG_SYNC}")
+
+# Packaging: module/ template + ko + sync-tool into one zip (CMake's own tar).
+set(UG_STAGE "${CMAKE_BINARY_DIR}/stage")
+file(GLOB UG_MODULE_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/module/*")
+file(GLOB UG_MODULE_ITEMS CONFIGURE_DEPENDS RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/module"
+     "${CMAKE_CURRENT_SOURCE_DIR}/module/*")
+set(UG_ZIP "${CMAKE_BINARY_DIR}/dist/${UG_ID}-${UG_VER}.zip")
+
+add_custom_command(OUTPUT "${UG_STAGE}/.stamp"
+  COMMAND ${CMAKE_COMMAND} -E rm -rf "${UG_STAGE}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${UG_STAGE}/ko"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/module" "${UG_STAGE}"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory "${KO_DIR}" "${UG_STAGE}/ko"
+  COMMAND ${CMAKE_COMMAND} -E copy "${UG_SYNC}" "${UG_STAGE}/sync-tool"
+  COMMAND ${CMAKE_COMMAND} -E touch "${UG_STAGE}/.stamp"
+  DEPENDS ${_ko_outputs} sync-tool ${UG_MODULE_FILES}
+  COMMENT "staging module contents"
+  VERBATIM)
+
+add_custom_command(OUTPUT "${UG_ZIP}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dist"
+  COMMAND ${CMAKE_COMMAND} -E rm -f "${UG_ZIP}"
+  COMMAND ${CMAKE_COMMAND} -E tar cf "${UG_ZIP}" --format=zip -- ${UG_MODULE_ITEMS} sync-tool ko
+  WORKING_DIRECTORY "${UG_STAGE}"
+  DEPENDS "${UG_STAGE}/.stamp"
+  COMMENT "packing ${UG_ZIP}"
+  VERBATIM)
+
+add_custom_target(module ALL DEPENDS "${UG_ZIP}")

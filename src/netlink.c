@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * netlink.c - policy injection channel from privileged userspace into the kernel.
+ *
+ * Protocol (little endian, matches src/tools/sync-tool.cpp):
+ *   KAUX_CMD_SET:  attr KAUX_ATTR_BLOB = u32 npairs, then npairs * (caller, target)
+ *                  caller == 0 means "any caller"
+ *   KAUX_CMD_PING: no payload, ACK only
+ */
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/version.h>
+#include <net/genetlink.h>
+#include "uidfake.h"
+
+#define KAUX_FAMILY_NAME "kaux"
+#define KAUX_FAMILY_VERSION 1
+
+enum { KAUX_ATTR_UNSPEC, KAUX_ATTR_BLOB, __KAUX_ATTR_MAX };
+#define KAUX_ATTR_MAX (__KAUX_ATTR_MAX - 1)
+
+enum { KAUX_CMD_UNSPEC, KAUX_CMD_SET, KAUX_CMD_PING, __KAUX_CMD_MAX };
+#define KAUX_CMD_MAX (__KAUX_CMD_MAX - 1)
+
+#define MAX_BLOB_BYTES 8192
+
+static int kaux_set(struct sk_buff *skb, struct genl_info *info)
+{
+    const u32 *p;
+    u32 len, npairs;
+
+    if (!info->attrs[KAUX_ATTR_BLOB])
+        return -EINVAL;
+    p = nla_data(info->attrs[KAUX_ATTR_BLOB]);
+    len = nla_len(info->attrs[KAUX_ATTR_BLOB]);
+    if (len < 4 || (len & 3) || len > MAX_BLOB_BYTES)
+        return -EINVAL;
+
+    /* blob: u32 npairs, then npairs * (caller, target uid); caller = 0 means any */
+    npairs = p[0];
+    if ((unsigned long long)len < 4ull + 8ull * npairs)
+        return -EINVAL;
+
+    policy_apply(p + 1, npairs);
+    return 0;
+}
+
+static int kaux_ping(struct sk_buff *skb, struct genl_info *info)
+{
+    return 0;
+}
+
+static const struct genl_ops kaux_ops[] = {
+    { .cmd = KAUX_CMD_SET,  .flags = GENL_ADMIN_PERM, .doit = kaux_set },
+    { .cmd = KAUX_CMD_PING, .flags = GENL_ADMIN_PERM, .doit = kaux_ping },
+};
+
+static const struct genl_multicast_group kaux_mcgrps[] = { { .name = "events" } };
+
+static struct genl_family kaux_family = {
+    .name     = KAUX_FAMILY_NAME,
+    .version  = KAUX_FAMILY_VERSION,
+    .maxattr  = KAUX_ATTR_MAX,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+    .resv_start_op = KAUX_CMD_MAX + 1,
+#endif
+    .module   = THIS_MODULE,
+    .ops      = kaux_ops,
+    .n_ops    = ARRAY_SIZE(kaux_ops),
+    .mcgrps   = kaux_mcgrps,
+    .n_mcgrps = ARRAY_SIZE(kaux_mcgrps),
+};
+
+int netlink_init(void)
+{
+    int rc = genl_register_family(&kaux_family);
+    pr_info("uidfake: netlink family '%s' register rc=%d\n", KAUX_FAMILY_NAME, rc);
+    return rc;
+}
+
+void netlink_exit(void)
+{
+    genl_unregister_family(&kaux_family);
+}
