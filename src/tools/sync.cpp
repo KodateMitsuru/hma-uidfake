@@ -58,8 +58,10 @@ std::optional<Config> parse_args(int argc, char **argv) {
 
 void Syncer::sync_now() {
     const auto policy = HmaPolicy::load(config_.config);
-    if (!policy)
+    if (!policy) {
+        Log::warn("cannot read {} (keeping the previous policy)", config_.config.string());
         return;
+    }
 
     const auto packages = PackageDb::load(config_.packages_list, config_.packages_xml);
     if (!packages) {
@@ -85,6 +87,12 @@ bool Syncer::run() {
     for (;;) {
         if (!watcher_.wait())
             return false;
+        /*
+         * Re-arm on every tick, not only on events: before the first unlock none of the
+         * encrypted paths exist, so there are no events to react to and the watches would
+         * otherwise never come back.
+         */
+        watcher_.apply_watches();
         sync_now();
     }
 }

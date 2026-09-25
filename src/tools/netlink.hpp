@@ -35,11 +35,13 @@ private:
     static constexpr std::size_t kReplySize = 4096;
 
     [[nodiscard]] bool ensure_connected();
+    [[nodiscard]] bool send_once(std::span<const Pair> pairs);
     [[nodiscard]] std::optional<std::uint16_t> resolve_family();
     [[nodiscard]] bool exchange(std::span<const std::byte> request, std::span<std::byte> reply);
 
     Fd socket_;
     std::optional<std::uint16_t> family_;
+    std::uint32_t seq_ = 0;   /* one per request; replies are matched against it */
 };
 
 }  // namespace uidfake

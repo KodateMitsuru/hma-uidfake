@@ -40,11 +40,19 @@ bool Watcher::open(const std::filesystem::path &config,
         return false;
     }
 
-    add(config, kFileEvents);
-    add(config.parent_path(), kDirEvents);
-    add(packages_list, kFileEvents);
-    add(packages_xml, kFileEvents);
-    add("/data/system", kDirEvents);
+    /*
+     * Declare what we want and arm it best effort: config.json in particular may not exist
+     * yet, and a failed watch used to mean the file stayed invisible for the whole lifetime
+     * of the process (that is how changes went missing).
+     */
+    desired_ = {
+        { .path = config, .mask = kFileEvents },
+        { .path = config.parent_path(), .mask = kDirEvents },
+        { .path = packages_list, .mask = kFileEvents },
+        { .path = packages_xml, .mask = kFileEvents },
+        { .path = "/data/system", .mask = kDirEvents },
+    };
+    apply_watches();
 
     itimerspec timer{};
     timer.it_value.tv_sec = kResync.count();
@@ -56,11 +64,32 @@ bool Watcher::open(const std::filesystem::path &config,
     return true;
 }
 
+void Watcher::apply_watches() {
+    for (const auto &want : desired_)
+        add(want.path, want.mask);
+}
+
+bool Watcher::watches_complete() const {
+    return std::ranges::all_of(desired_, [](const Watch &w) { return !w.warned; });
+}
+
 void Watcher::add(const std::filesystem::path &path, std::uint32_t mask) {
+    /* Remember which of the wanted watches are not armed yet: that is also what tells the
+     * resync timer to come back sooner, since these paths only appear once /data is unlocked. */
+    const auto wanted = std::ranges::find_if(desired_, [&](const Watch &w) { return w.path == path; });
+
     const int wd = ::inotify_add_watch(inotify_.get(), path.c_str(), mask);
     if (wd < 0) {
-        Log::warn("cannot watch {}: {}", path.string(), std::strerror(errno));
+        if (wanted != desired_.end() && !wanted->warned) {
+            wanted->warned = true;
+            Log::warn("cannot watch {} yet: {} (retrying; /data may still be encrypted)",
+                      path.string(), std::strerror(errno));
+        }
         return;
+    }
+    if (wanted != desired_.end() && wanted->warned) {
+        wanted->warned = false;
+        Log::info("watching {} now", path.string());
     }
     for (auto &watch : watches_) {
         if (watch.wd == wd) {
@@ -72,9 +101,24 @@ void Watcher::add(const std::filesystem::path &path, std::uint32_t mask) {
 }
 
 void Watcher::arm_debounce() {
-    itimerspec timer{};
-    timer.it_value.tv_nsec = std::chrono::duration_cast<std::chrono::nanoseconds>(kDebounce).count();
-    ::timerfd_settime(debounce_.get(), 0, &timer, nullptr);
+    const auto now = std::chrono::steady_clock::now();
+
+    /* First event of a burst: wait out the quiet period. */
+    if (!pending_) {
+        pending_ = now;
+        itimerspec timer{};
+        timer.it_value.tv_nsec =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(kDebounce).count();
+        ::timerfd_settime(debounce_.get(), 0, &timer, nullptr);
+        return;
+    }
+
+    /* Changes keep arriving: sync anyway, no later than kDebounceMax after the first one. */
+    if (now - *pending_ >= kDebounceMax) {
+        itimerspec timer{};
+        timer.it_value.tv_nsec = 1;
+        ::timerfd_settime(debounce_.get(), 0, &timer, nullptr);
+    }
 }
 
 bool Watcher::handle_inotify_events() {
@@ -84,6 +128,7 @@ bool Watcher::handle_inotify_events() {
         return false;
 
     bool interesting = false;
+    bool rearm = false;
     for (ssize_t offset = 0; offset < count;) {
         const auto *event = reinterpret_cast<const inotify_event *>(buffer.data() + offset);
         offset += static_cast<ssize_t>(sizeof(*event)) + event->len;
@@ -91,16 +136,18 @@ bool Watcher::handle_inotify_events() {
         if (event->mask & IN_Q_OVERFLOW) {
             Log::warn("inotify queue overflow, resyncing");
             interesting = true;
+            rearm = true;
             continue;
         }
         if (event->mask & IN_IGNORED) {
-            for (const auto &watch : watches_) {
-                if (watch.wd == event->wd) {
-                    add(watch.path, watch.mask);
-                    break;
-                }
-            }
+            /* The inode went away (an atomic replace) or the watch was dropped: re-arm. */
+            interesting = true;
+            rearm = true;
             continue;
+        }
+        if (event->mask & (IN_CREATE | IN_MOVED_TO | IN_DELETE | IN_MOVED_FROM)) {
+            /* A file we could not watch before may exist now, or vice versa. */
+            rearm = true;
         }
         if (event->len > 0 && !std::string_view{ event->name }.starts_with(kPackagesPrefix)) {
             const bool watches_data_system = std::ranges::any_of(watches_, [&](const Watch &w) {
@@ -111,6 +158,10 @@ bool Watcher::handle_inotify_events() {
         }
         interesting = true;
     }
+
+    if (rearm)
+        apply_watches();
+
     return interesting;
 }
 
@@ -132,10 +183,18 @@ std::optional<Watcher::Tick> Watcher::wait() {
             arm_debounce();
 
         std::uint64_t expirations = 0;
-        if (fds[1].revents != 0 && ::read(debounce_.get(), &expirations, sizeof(expirations)) > 0)
+        if (fds[1].revents != 0 && ::read(debounce_.get(), &expirations, sizeof(expirations)) > 0) {
+            pending_.reset();
             return Tick::Debounce;
-        if (fds[2].revents != 0 && ::read(resync_.get(), &expirations, sizeof(expirations)) > 0)
+        }
+        if (fds[2].revents != 0 && ::read(resync_.get(), &expirations, sizeof(expirations)) > 0) {
+            /* Retry sooner while a watch is still missing, so an unlock is picked up quickly. */
+            itimerspec next{};
+            next.it_value.tv_sec = watches_complete() ? kResync.count() : kResyncPending.count();
+            next.it_interval.tv_sec = kResync.count();
+            ::timerfd_settime(resync_.get(), 0, &next, nullptr);
             return Tick::Resync;
+        }
     }
 }
 

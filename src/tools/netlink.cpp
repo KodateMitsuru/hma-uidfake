@@ -4,6 +4,8 @@
 #include <cstring>
 #include <vector>
 
+#include <sys/time.h>
+
 #include <sys/socket.h>
 
 #include <linux/genetlink.h>
@@ -78,12 +80,22 @@ bool NetlinkClient::exchange(std::span<const std::byte> request, std::span<std::
     iov.iov_len = reply.size();
     const ssize_t received = ::recvmsg(socket_.get(), &message, 0);
     if (received < 0) {
-        Log::warn("recvmsg: {}", std::strerror(errno));
+        /* EAGAIN is the read deadline firing: the module is gone or never answered. */
+        Log::warn("recvmsg: {}",
+                  errno == EAGAIN ? "timed out waiting for the kernel" : std::strerror(errno));
         return false;
     }
 
     const auto *header = reinterpret_cast<const nlmsghdr *>(reply.data());
+    bool answered = false;
     for (int left = static_cast<int>(received); nlmsg_ok(header, left);) {
+        const int step = static_cast<int>(NLMSG_ALIGN(header->nlmsg_len));
+        if (header->nlmsg_seq != seq_) {
+            /* A late reply to a request that already timed out; ignore it. */
+            left -= step;
+            header = nlmsg_next(header);
+            continue;
+        }
         if (header->nlmsg_type == NLMSG_ERROR) {
             const auto *error = reinterpret_cast<const nlmsgerr *>(NLMSG_DATA(header));
             if (error->error != 0) {
@@ -91,10 +103,11 @@ bool NetlinkClient::exchange(std::span<const std::byte> request, std::span<std::
                 return false;
             }
         }
-        left -= static_cast<int>(NLMSG_ALIGN(header->nlmsg_len));
+        answered = true;
+        left -= step;
         header = nlmsg_next(header);
     }
-    return true;
+    return answered;
 }
 
 std::optional<std::uint16_t> NetlinkClient::resolve_family() {
@@ -109,7 +122,7 @@ std::optional<std::uint16_t> NetlinkClient::resolve_family() {
     nlh->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN + NLA_HDRLEN + static_cast<int>(name_len));
     nlh->nlmsg_type = GENL_ID_CTRL;
     nlh->nlmsg_flags = NLM_F_REQUEST;
-    nlh->nlmsg_seq = 1;
+    nlh->nlmsg_seq = ++seq_;
 
     auto *genl = request.genlmsg();
     genl->cmd = CTRL_CMD_GETFAMILY;
@@ -169,11 +182,36 @@ bool NetlinkClient::ensure_connected() {
         return false;
     }
 
+    /*
+     * Both directions need a deadline. If the module is unloaded between our request and the
+     * reply there is nothing to receive, and without one the helper would sit in recvmsg()
+     * forever: that is the "cannot connect after rmmod/insmod" symptom.
+     */
+    timeval deadline{ .tv_sec = 0, .tv_usec = 500 * 1000 };
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline));
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &deadline, sizeof(deadline));
+
     socket_.reset(fd);
     return true;
 }
 
 bool NetlinkClient::push(std::span<const Pair> pairs) {
+    /*
+     * Two attempts. A failure drops the cached family id together with the socket, so a module
+     * that was unloaded and reloaded (it gets a new family id) is found again on the retry
+     * instead of the client talking to a dead id for the rest of its life.
+     */
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (send_once(pairs))
+            return true;
+        family_.reset();
+        socket_.reset();
+    }
+    Log::warn("kernel side unreachable, keeping the previous policy");
+    return false;
+}
+
+bool NetlinkClient::send_once(std::span<const Pair> pairs) {
     if (!ensure_connected())
         return false;
 
@@ -192,7 +230,7 @@ bool NetlinkClient::push(std::span<const Pair> pairs) {
     nlh->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN + NLA_HDRLEN + static_cast<int>(blob_len));
     nlh->nlmsg_type = *family_;
     nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
-    nlh->nlmsg_seq = 1;
+    nlh->nlmsg_seq = ++seq_;
 
     auto *genl = request.genlmsg();
     genl->cmd = kCmdSet;
