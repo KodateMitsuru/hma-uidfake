@@ -5,12 +5,13 @@
  * Two things matter here:
  *  1) the lookup cost must not depend on the result: fixed 16-step binary search plus
  *     a fixed 32-entry window scan, accumulated with masks;
- *  2) every target carries a precomputed replacement uid in the **same hash bucket**:
- *     find_user() buckets by __uidhashfn(uid) = ((uid >> 7) + uid) & 127 and walks the
- *     whole chain. Swapping the target for a non-existent uid in that same bucket makes
- *     the lookup cost identical to a uid that genuinely does not exist (same chain,
- *     same miss). The value is 0x40000000 + bucket, a range that cannot hold a
- *     user_struct.
+ *  2) every target carries a precomputed replacement uid in the **same hash bucket** as
+ *     the target: find_user() walks uid_hashtable[uid_hash(uid)], and swapping the target
+ *     for a uid that hashes there but does not exist makes the lookup cost identical to a
+ *     uid that genuinely does not exist (same chain, same miss). The hash is read back
+ *     from find_user() itself at apply time (see detect_uid_hash()) instead of being
+ *     assumed, because a vendor kernel may bucket uids differently than the module was
+ *     built against.
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -47,28 +48,145 @@ static void sort_pairs(struct uid_pair *a, u32 n)
 }
 
 /*
- * Same-bucket replacement uid. The kernel hashes uids with
- * __uidhashfn(uid) = ((uid >> UIDHASH_BITS) + uid) & MASK. 0x40000000 lands in bucket
- * 0 and every +1 moves the bucket by one (no 128 boundary crossing), so
- *   0x40000000 + bucket(target)
- * is a uid in the same bucket as target that can never exist.
+ * Which hash does the running kernel bucket uids with?
+ *
+ * find_user() looks up uid_hashtable[uid_hash(uid)], and uid_hash() is a static inline
+ * in kernel/user.c, so the formula is visible in find_user()'s own code. It is one of:
+ *
+ *   __uidhashfn:   ((uid >> BITS) + uid) & (SZ - 1)     (all GKI 5.10 .. 6.18)
+ *   hash_32:       uid * 0x61c88647 >> (32 - BITS)      (mainline)
+ *
+ * Reading it back matters: the replacement uid has to land in the same bucket as the
+ * hidden uid, otherwise a hidden uid and a uid that simply does not exist walk different
+ * hash chains and cost measurably different amounts of time.
  */
-static u32 make_replace(u32 target)
+#define UID_HASH_BASE 0x40000000u
+#define UID_HASH_GOLDEN 0x61c88647u
+
+struct uid_hash {
+	u8 bits;
+	u8 shift;
+	bool multiply;
+};
+
+/* Assumed until detect_uid_hash() says otherwise; logged either way. */
+static struct uid_hash g_hash = { .bits = 7, .shift = 25, .multiply = false };
+
+static u32 uid_hash_apply(const struct uid_hash *h, u32 uid)
 {
-	u32 cand = 0x40000000u + (target & (FAKE_UIDHASH_SZ - 1));
-	struct user_struct *us;
+	if (h->multiply)
+		return (u32)(((u64)uid * UID_HASH_GOLDEN) >> h->shift);
+
+	return ((uid >> h->bits) + uid) & ((1u << h->bits) - 1);
+}
+
+static bool uid_hash_bits_ok(u32 bits)
+{
+	return bits == 3 || bits == 7 || bits == 8;
+}
+
+/*
+ * Scan find_user() for one of the two instruction patterns. aarch64:
+ *   lsr  wA, wB, #BITS                  UBFM 32-bit with imms = 31
+ *   add  wC, w?, w?                     one operand is wA
+ *   movz wD, #0x8647
+ *   movk wD, #0x61c8, lsl #16
+ *   lsr  wD, wD, #32-BITS
+ */
+static bool detect_uid_hash(struct uid_hash *out)
+{
+	const u32 *code = (const u32 *)find_user;
 	u32 i;
 
-	/* re-check the bucket with the real function (defensive) */
-	for (i = 0; i < FAKE_UIDHASH_SZ; i++, cand++) {
-		if (FAKE_UIDHASH(cand) != FAKE_UIDHASH(target))
+	for (i = 0; i + 4 < 128; i++) {
+		u32 w0 = READ_ONCE(code[i]);
+
+		/*
+		 * __uidhashfn: clang emits it as one ADD with a shifted operand
+		 *   add wA, wN, wN, lsr #BITS      (Rn == Rm, shift = LSR)
+		 *   and wA, wA, #(SZ-1)
+		 */
+		if ((w0 & 0xFFE00000u) == 0x0B400000u &&
+		    ((w0 >> 5) & 0x1Fu) == ((w0 >> 16) & 0x1Fu)) {
+			u32 bits = (w0 >> 10) & 0x3Fu;
+
+			if (uid_hash_bits_ok(bits)) {
+				out->bits = (u8)bits;
+				out->shift = (u8)(32 - bits);
+				out->multiply = false;
+				return true;
+			}
+		}
+
+		/* movz wD, #0x8647 */
+		if ((w0 & 0xFF800000u) != 0x52800000u ||
+		    ((w0 >> 5) & 0xFFFFu) != 0x8647u || ((w0 >> 21) & 0x3u) != 0u)
+			continue;
+
+		/*
+		 * hash_32: movz #0x8647 ... movk #0x61c8, lsl #16 ... umull / mul ...
+		 *          lsr #(32 - BITS)   or   ubfx #(32 - BITS), #32
+		 *
+		 * The two halves of the constant can be separated by a BTI/hint
+		 * (clang 14 inserts one), and the bucket extraction can be a UBFX
+		 * when the result also feeds the array index.
+		 */
+		{
+			u32 j, m;
+
+			for (j = 1; j < 6; j++) {
+				u32 wj = READ_ONCE(code[i + j]);
+
+				if ((wj & 0xFF800000u) != 0x72800000u ||
+				    ((wj >> 5) & 0xFFFFu) != 0x61c8u ||
+				    ((wj >> 21) & 0x3u) != 1u)
+					continue;
+
+				for (m = j + 1; m < j + 10; m++) {
+					u32 wk = READ_ONCE(code[i + m]);
+					u32 lsb, imms;
+
+					if (!((wk & 0xFFC00000u) == 0x53000000u ||
+					      (wk & 0xFFC00000u) == 0xD3400000u))
+						continue;
+					lsb = (wk >> 16) & 0x3Fu;
+					imms = (wk >> 10) & 0x3Fu;
+					/* lsr (32/64-bit) or ubfx covering the whole word */
+					if (imms != 31u && imms != 63u && imms != (lsb + 31u))
+						continue;
+					if (lsb < 24 || lsb > 29 || !uid_hash_bits_ok(32 - lsb))
+						continue;
+					out->bits = (u8)(32 - lsb);
+					out->shift = (u8)lsb;
+					out->multiply = true;
+					return true;
+				}
+				break;	/* constant found, its high half is unique */
+			}
+		}
+	}
+
+	return false;
+}
+
+static u32 make_replace(u32 target)
+{
+	u32 want = uid_hash_apply(&g_hash, target);
+	u32 k;
+
+	for (k = 0; k < (1u << 20); k++) {
+		u32 cand = UID_HASH_BASE + k;
+		struct user_struct *us;
+
+		if (uid_hash_apply(&g_hash, cand) != want)
 			continue;
 		us = find_user(KUIDT_INIT(cand));
 		if (!us)
 			return cand;
 		free_uid(us);
 	}
-	pr_warn("uidfake: no replace uid for %u, fallback sentinel\n", target);
+
+	pr_warn("uidfake: no same-bucket replacement for %u\n", target);
 	return 0x7fffffffu;
 }
 
@@ -95,6 +213,19 @@ void policy_apply(const u32 *pairs, u32 npairs)
 
 	if (n)
 		sort_pairs(g_pairs, n);
+
+	if (n) {
+		struct uid_hash h;
+
+		if (detect_uid_hash(&h)) {
+			g_hash = h;
+			pr_info("uidfake: uid hash = %s bits=%u (read from find_user)\n",
+				h.multiply ? "hash_32" : "__uidhashfn", h.bits);
+		} else {
+			pr_warn("uidfake: cannot read uid hash from find_user; keeping %s bits=%u\n",
+				g_hash.multiply ? "hash_32" : "__uidhashfn", g_hash.bits);
+		}
+	}
 
 	/* pairs are sorted by target, so repeated targets share one replacement */
 	for (i = 0; i < n; i++) {

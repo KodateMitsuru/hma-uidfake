@@ -11,6 +11,7 @@ project(hma-uidfake LANGUAGES NONE)
 
 set(DDK_ROOT "/opt/ddk" CACHE PATH "DDK root (provides kdir/ and clang/)")
 set(UG_NDK "" CACHE PATH "Android NDK root")
+option(UG_USE_PREBUILT_KO "Package existing kernel modules from build/ko" OFF)
 
 # KMI -> clang shipped with the DDK. android12-5.10 is absent on purpose: that kernel
 # tree uses GCC global register variables and "Q" constraints, which clang rejects.
@@ -62,36 +63,43 @@ endif()
 # build/kmi/<kmi>/ -- a directory that only holds symlinks to src/. The source tree
 # is therefore never written to, and no copy of it is needed either.
 set(_ko_outputs "")
-foreach(_pair IN LISTS UG_KMI_CLANG)
-  string(REPLACE ":" ";" _p "${_pair}")
-  list(GET _p 0 _kmi)
-  list(GET _p 1 _clang)
-  set(_kdir "${DDK_ROOT}/kdir/${_kmi}")
-  set(_clang_bin "${DDK_ROOT}/clang/${_clang}/bin")
-  set(_stage "${CMAKE_BINARY_DIR}/kmi/${_kmi}")
-  set(_out "${KO_DIR}/${_kmi}_arm64_${KO_NAME}.ko")
-
-  if(NOT EXISTS "${_kdir}" OR NOT EXISTS "${_clang_bin}")
-    message(FATAL_ERROR "missing DDK tree or clang for ${_kmi}: ${_kdir} / ${_clang_bin}")
+if(UG_USE_PREBUILT_KO)
+  file(GLOB _ko_outputs CONFIGURE_DEPENDS "${KO_DIR}/*.ko")
+  if(NOT _ko_outputs)
+    message(FATAL_ERROR "UG_USE_PREBUILT_KO is enabled, but no kernel modules were found in ${KO_DIR}")
   endif()
+else()
+  foreach(_pair IN LISTS UG_KMI_CLANG)
+    string(REPLACE ":" ";" _p "${_pair}")
+    list(GET _p 0 _kmi)
+    list(GET _p 1 _clang)
+    set(_kdir "${DDK_ROOT}/kdir/${_kmi}")
+    set(_clang_bin "${DDK_ROOT}/clang/${_clang}/bin")
+    set(_stage "${CMAKE_BINARY_DIR}/kmi/${_kmi}")
+    set(_out "${KO_DIR}/${_kmi}_arm64_${KO_NAME}.ko")
 
-  file(MAKE_DIRECTORY "${_stage}")
-  foreach(_f IN LISTS SRC_ITEMS)
-    get_filename_component(_name "${_f}" NAME)
-    file(CREATE_LINK "${_f}" "${_stage}/${_name}" SYMBOLIC RESULT _ignored)
+    if(NOT EXISTS "${_kdir}" OR NOT EXISTS "${_clang_bin}")
+      message(FATAL_ERROR "missing DDK tree or clang for ${_kmi}: ${_kdir} / ${_clang_bin}")
+    endif()
+
+    file(MAKE_DIRECTORY "${_stage}")
+    foreach(_f IN LISTS SRC_ITEMS)
+      get_filename_component(_name "${_f}" NAME)
+      file(CREATE_LINK "${_f}" "${_stage}/${_name}" SYMBOLIC RESULT _ignored)
+    endforeach()
+
+    add_custom_command(OUTPUT "${_out}"
+      COMMAND ${CMAKE_COMMAND} -E env "PATH=${_clang_bin}:$ENV{PATH}"
+              ${CMAKE_MAKE_PROGRAM} -C ${_kdir} ARCH=arm64 LLVM=1 M=${_stage} modules
+      COMMAND "${_clang_bin}/llvm-strip" -d "${_stage}/${KO_NAME}.ko"
+      COMMAND ${CMAKE_COMMAND} -E copy "${_stage}/${KO_NAME}.ko" "${_out}"
+      DEPENDS ${SRC_FILES}
+      COMMENT "kbuild ${_kmi}"
+      VERBATIM)
+    add_custom_target("ko-${_kmi}" DEPENDS "${_out}")
+    list(APPEND _ko_outputs "${_out}")
   endforeach()
-
-  add_custom_command(OUTPUT "${_out}"
-    COMMAND ${CMAKE_COMMAND} -E env "PATH=${_clang_bin}:$ENV{PATH}"
-            ${CMAKE_MAKE_PROGRAM} -C ${_kdir} ARCH=arm64 LLVM=1 M=${_stage} modules
-    COMMAND "${_clang_bin}/llvm-strip" -d "${_stage}/${KO_NAME}.ko"
-    COMMAND ${CMAKE_COMMAND} -E copy "${_stage}/${KO_NAME}.ko" "${_out}"
-    DEPENDS ${SRC_FILES}
-    COMMENT "kbuild ${_kmi}"
-    VERBATIM)
-  add_custom_target("ko-${_kmi}" DEPENDS "${_out}")
-  list(APPEND _ko_outputs "${_out}")
-endforeach()
+endif()
 add_custom_target(ko DEPENDS ${_ko_outputs})
 
 # sync-tool: src/tools is a standalone CMake project, cross compiled with the NDK.

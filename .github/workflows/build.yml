@@ -3,7 +3,7 @@ name: build
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -50,7 +50,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ko-${{ matrix.kmi }}
-          path: ${{ runner.temp }}/ko/*.ko
+          path: out/*.ko
           if-no-files-found: error
 
   pack:
@@ -64,17 +64,30 @@ jobs:
           path: build/ko
           pattern: ko-*
           merge-multiple: true
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y nlohmann-json3-dev
       - uses: nttld/setup-ndk@v1
         id: ndk
         with:
           ndk-version: r27c
-          local-cache: true
+          # Do not reuse a partially restored NDK archive; the local cache can
+          # contain source.properties while missing the LLVM toolchain.
+          local-cache: false
+      - name: Validate NDK toolchain
+        run: |
+          set -euo pipefail
+          ndk="${{ steps.ndk.outputs.ndk-path }}"
+          test -x "$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+          test -f "$ndk/build/cmake/android.toolchain.cmake"
       - name: Configure
         run: |
           set -euo pipefail
-          # pretend the downloaded modules are fresh: no DDK on this runner
-          touch build/ko/*.ko
-          cmake -S . -B build -DUG_NDK="${{ steps.ndk.outputs.ndk-path }}"
+          cmake -S . -B build \
+            -DUG_NDK="${{ steps.ndk.outputs.ndk-path }}" \
+            -DUG_USE_PREBUILT_KO=ON
       - name: Build and pack
         run: |
           set -euo pipefail

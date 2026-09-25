@@ -9,14 +9,10 @@
 #define POLICY_MAX_PAIRS 4096
 #define POLICY_SCAN_WIN  32
 
-/* must match kernel/user.c __uidhashfn: ((uid >> BITS) + uid) & MASK */
-#if defined(CONFIG_BASE_SMALL) && CONFIG_BASE_SMALL
-#define FAKE_UIDHASH_BITS 3
-#else
-#define FAKE_UIDHASH_BITS 7
-#endif
-#define FAKE_UIDHASH_SZ   (1 << FAKE_UIDHASH_BITS)
-#define FAKE_UIDHASH(u)   ((((u) >> FAKE_UIDHASH_BITS) + (u)) & (FAKE_UIDHASH_SZ - 1))
+/*
+ * The uid hash is not hardcoded here on purpose: policy.c reads the formula the
+ * running kernel actually uses back from find_user() at policy-apply time.
+ */
 
 extern rwlock_t policy_lock;
 
