@@ -2,7 +2,7 @@
 #include <linux/cred.h>
 #include <linux/ioprio.h>
 #include <linux/kernel.h>
-#include <linux/kprobes.h>
+
 #include <linux/module.h>
 #include <linux/resource.h>
 #include <linux/sched.h>
@@ -38,7 +38,7 @@ struct hook_entry {
  * /proc/<tid>/syscall, ptrace and the syscall-exit stop keep seeing the original argument.
  *
  * This is the mechanism KernelSU uses. Fallback: if the table cannot be resolved or patched,
- * the verified kprobe hook is registered instead.
+ * the verified sys_call_table patch is the only hook.
  */
 
 asmlinkage long uidfake_getpriority(const struct pt_regs *regs);
@@ -146,28 +146,6 @@ asmlinkage long uidfake32_ioprio_set(const struct pt_regs *regs)
 }
 #endif
 
-/* ---- kprobe fallback ---- */
-
-static int hook_pre(struct kprobe *kp, struct pt_regs *regs)
-{
-	u64 orig = regs->regs[ARG_UID];
-	u32 repl = policy_lookup((u32)__kuid_val(current_fsuid()), (u32)orig);
-	u64 cand, val;
-
-	cand = (orig & ~0xffffffffULL) | (u64)repl;
-
-	/* one cmp + csel: hit and miss execute the same instruction stream */
-	asm("cmp\t%w[r], #0\n\tcsel\t%[v], %[c], %[o], ne"
-	    : [v] "=r"(val)
-	    : [r] "r"(repl), [c] "r"(cand), [o] "r"(orig)
-	    : "cc");
-
-	regs->regs[ARG_UID] = val;
-	return 0;
-}
-
-static struct kprobe g_probe;
-
 /* ---- table patching ---- */
 
 static uidfake_syscall_t *main_table;
@@ -242,30 +220,24 @@ static int patch_tables(void)
 
 int hooks_install(void)
 {
+	/* the sys_call_table patch is the only hook now: no kprobe fallback */
 	if (!patch_tables())
 		return 1;
 
-	memset(&g_probe, 0, sizeof(g_probe));
-	g_probe.symbol_name = "find_user";
-	g_probe.pre_handler = hook_pre;
-	if (register_kprobe(&g_probe) < 0) {
-		pr_warn("uidfake: no hook could be installed\n");
-		return 0;
-	}
-	pr_info("uidfake: fallback kprobe on find_user (uid in x%d)\n", ARG_UID);
-	return 1;
+	pr_warn("uidfake: could not hook sys_call_table, no hook installed\n");
+	return 0;
 }
 
 void hooks_remove(void)
 {
-	if (main_table) {
-		unpatch_entries(main_table, g_hook, ARRAY_SIZE(g_hook));
-#ifdef CONFIG_COMPAT
-		unpatch_entries(compat_table, g_chook, ARRAY_SIZE(g_chook));
-		compat_table = NULL;
-#endif
-		main_table = NULL;
+	/* nothing was patched means nothing to tear down: there is no fallback */
+	if (!main_table)
 		return;
-	}
-	unregister_kprobe(&g_probe);
+
+	unpatch_entries(main_table, g_hook, ARRAY_SIZE(g_hook));
+#ifdef CONFIG_COMPAT
+	unpatch_entries(compat_table, g_chook, ARRAY_SIZE(g_chook));
+	compat_table = NULL;
+#endif
+	main_table = NULL;
 }
