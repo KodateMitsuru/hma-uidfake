@@ -13,24 +13,28 @@
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/rwlock.h>
+#include <linux/rcupdate.h>
+#include <linux/spinlock.h>
 #include <linux/slab.h>
 #include <linux/user.h>
 
 #include "uidfake.h"
 
-rwlock_t policy_lock;
+static DEFINE_SPINLOCK(g_pub_lock);	/* serialises publishers, never taken by a query */
 
-static struct uid_pair *g_tgt;
-static u64 *g_masks;
-static u16 *g_cid;
-static u32  g_nprobe = POLICY_WAY;
-static u32  g_nlines;
-static u32  g_shift;
-static u32  g_nmask_words;
-static u32  g_npairs;
-static u32  g_ncallers;
-static u32  g_mirror;
+/*
+ * One immutable policy snapshot behind an RCU pointer: a query reads the pointer once and then
+ * only touches that snapshot, so it needs no lock and can never see a half-applied policy (a
+ * pile of independent globals would have needed the lock just to read them consistently).
+ * policy_apply() builds a fresh snapshot with plain stores and publishes it with a single
+ * pointer swap; the snapshot it replaced is freed after a grace period.
+ */
+struct policy {
+	struct uid_pair *tgt;
+	u64 *masks;
+	u16 *cid;
+	u32 nprobe, nlines, shift, nmask_words, npairs, ncallers, mirror;
+};
 
 /*
  * Zeroed stand-in tables, installed by policy_reset(): a lookup with no policy loaded
@@ -40,6 +44,21 @@ static u32  g_mirror;
 static struct uid_pair dummy_tgt[POLICY_MIN_LINES * POLICY_WAY];
 static u64 dummy_masks[POLICY_MIN_LINES * POLICY_WAY];
 static u16 dummy_cid[POLICY_APP_ID_SPAN];
+
+/* The empty snapshot a query starts on, so the hot path needs no NULL check. */
+static struct policy g_empty = {
+	.tgt = dummy_tgt,
+	.masks = dummy_masks,
+	.cid = dummy_cid,
+	.nprobe = POLICY_WAY,
+	.nlines = POLICY_MIN_LINES,
+	.shift = 32 - 4,
+	.nmask_words = 1,
+	.mirror = 0,
+};
+
+/* The published snapshot: one pointer swap, so a query reads a consistent whole. */
+static struct policy *g_pol __rcu = &g_empty;
 
 struct apply_pair { u32 caller; u32 target; };
 
@@ -348,14 +367,46 @@ fail:
 	return -1;
 }
 
+static void policy_release(struct policy *p)
+{
+	if (!p || p == &g_empty)
+		return;
+	kfree(p->tgt);
+	kfree(p->masks);
+	kfree(p->cid);
+	kfree(p);
+}
+
+/*
+ * Publish a snapshot: one store makes it visible, and the snapshot it replaced is only freed
+ * once every query that could still be inside it has finished.
+ */
+static void policy_publish(struct policy *np)
+{
+	struct policy *old;
+	unsigned long flags;
+
+	spin_lock_irqsave(&g_pub_lock, flags);
+	old = rcu_dereference_protected(g_pol, true);
+	rcu_assign_pointer(g_pol, np);
+	spin_unlock_irqrestore(&g_pub_lock, flags);
+
+	synchronize_rcu();
+	policy_release(old);
+}
+
 void policy_apply(const u32 *pairs, u32 npairs)
 {
-	unsigned long flags;
+	struct policy *np;
 	struct layout l = { };
 	struct apply_pair *tmp;
 	u32 *hid;
 	u32 i, n = 0;
 	int nh, ok = 0;
+
+	np = (struct policy *)kzalloc(sizeof(*np), GFP_KERNEL);
+	if (!np)
+		return;
 
 	tmp = kcalloc(POLICY_MAX_PAIRS, sizeof(*tmp), GFP_KERNEL);
 	hid = kcalloc(POLICY_MAX_CALLERS, sizeof(*hid), GFP_KERNEL);
@@ -372,7 +423,6 @@ void policy_apply(const u32 *pairs, u32 npairs)
 		n++;
 	}
 
-	write_lock_irqsave(&policy_lock, flags);
 
 	if (n) {
 		struct uid_hash h;
@@ -400,32 +450,25 @@ void policy_apply(const u32 *pairs, u32 npairs)
 	}
 
 	if (ok) {
-		struct uid_pair *o_tgt = g_tgt;
-		u64 *o_masks = g_masks;
-		u16 *o_cid = g_cid;
-
-		g_tgt = l.tgt;
-		g_masks = l.masks;
-		g_cid = l.cid;
-		g_nprobe = l.probe;
-		g_nlines = l.nlines;
-		g_shift = l.shift;
-		g_nmask_words = l.nmask_words;
-		g_npairs = n;
-		g_ncallers = nh > 0 ? (u32)nh : 0;
-		g_mirror = l.mirror;
+		np->tgt = l.tgt;
+		np->masks = l.masks;
+		np->cid = l.cid;
+		np->nprobe = l.probe;
+		np->nlines = l.nlines;
+		np->shift = l.shift;
+		np->nmask_words = l.nmask_words;
+		np->npairs = n;
+		np->ncallers = nh > 0 ? (u32)nh : 0;
+		np->mirror = l.mirror;
 		l.tgt = NULL;
 		l.masks = NULL;
 		l.cid = NULL;
-		if (o_tgt != dummy_tgt)
-			kfree(o_tgt);
-		if (o_masks != dummy_masks)
-			kfree(o_masks);
-		if (o_cid != dummy_cid)
-			kfree(o_cid);
 	}
 
-	write_unlock_irqrestore(&policy_lock, flags);
+
+	/* Publish first, so the self-check answers through the snapshot a caller would see. */
+	if (ok)
+		policy_publish(np);
 
 	if (ok) {
 		u32 checked = 0, hits = 0;
@@ -450,8 +493,11 @@ out:
 	kfree(l.cid);
 	kfree(hid);
 	kfree(tmp);
+	if (!ok)
+		kfree(np);
+
 	pr_info("uidfake: injected %u pair(s), %u caller(s), %u line(s), %u mask word(s), probe %u, %s layout\n",
-		npairs, g_ncallers, g_nlines, g_nmask_words, g_nprobe, g_mirror ? "uid-hash" : "own-hash");
+		npairs, np->ncallers, np->nlines, np->nmask_words, np->nprobe, np->mirror ? "uid-hash" : "own-hash");
 }
 
 EXPORT_SYMBOL_GPL(policy_apply);
@@ -546,11 +592,11 @@ static u32 policy_index_mode(u32 target, u32 mirror, u32 shift)
  * csel, and the caller dimension is allowed to differ between callers, so this costs nothing
  * on the fingerprint side.
  */
-static u32 caller_id(u32 caller)
+static u32 caller_id(u32 caller, const struct policy *p)
 {
 	u32 off = (caller % 100000u) - POLICY_APP_ID_MIN;
 	u32 in = off < POLICY_APP_ID_SPAN;
-	u32 id = g_cid[in ? off : 0];	/* one load either way */
+	u32 id = p->cid[in ? off : 0];	/* one load either way */
 
 	return (in && id != 0xffffu) ? id : POLICY_ID_NONE;
 }/*
@@ -558,13 +604,13 @@ static u32 caller_id(u32 caller)
  * then this is a single load and shift; otherwise every word is read and the bit is sampled
  * only from the word that owns the id.
  */
-static u32 mask_bit(const u64 *m, u32 cid)
+static u32 mask_bit(const u64 *m, u32 cid, const struct policy *p)
 {
 	u32 w, bit = 0;
 
-	if (g_nmask_words == 1)
+	if (p->nmask_words == 1)
 		return (u32)((m[0] >> (cid & 63)) & 1);
-	for (w = 0; w < g_nmask_words; w++)
+	for (w = 0; w < p->nmask_words; w++)
 		bit |= (u32)((m[w] >> (cid & 63)) & 1) & (u32)(w == (cid >> 6));
 	return bit;
 }
@@ -579,7 +625,7 @@ static u32 mask_bit(const u64 *m, u32 cid)
  */
 static __always_inline u32 policy_lookup_fast(uid_t caller, uid_t target)
 {
-	unsigned long flags;
+	const struct policy *p;
 	u32 c = (u32)caller, t = (u32)target;
 	u32 cid, repl = 0, hit = 0, wild = 0, rk = 0, k, unit, sub, eq, bit, h;
 	const struct uid_pair *sl;
@@ -588,8 +634,10 @@ static __always_inline u32 policy_lookup_fast(uid_t caller, uid_t target)
 	if ((caller % 100000) <= 1000 || caller == target)
 		return 0;
 
-	read_lock_irqsave(&policy_lock, flags);
-		cid = caller_id(c);
+	rcu_read_lock();
+	p = rcu_dereference(g_pol);
+
+		cid = caller_id(c, p);
 	/*
 	 * One hash for both the line and the slot inside it: the kernel's own uid hash gives
 	 * the bucket line directly (8 buckets per line) and its low bits give the starting
@@ -598,26 +646,26 @@ static __always_inline u32 policy_lookup_fast(uid_t caller, uid_t target)
 	h = policy_bucket(t, g_hash.bits, (u32)g_hash.multiply);
 	sub = h & (POLICY_WAY - 1);
 	{
-		u32 mir = h >> 3, own = policy_index_own(t, g_shift), m = (u32)0 - g_mirror;
+		u32 mir = h >> 3, own = policy_index_own(t, p->shift), m = (u32)0 - p->mirror;
 
 		unit = (mir & m) | (own & ~m);
 	}
-	sl = &g_tgt[(size_t)unit * POLICY_WAY];
-	mk = &g_masks[(size_t)unit * POLICY_WAY * g_nmask_words];
-	if (g_nprobe == 1) {
+	sl = &p->tgt[(size_t)unit * POLICY_WAY];
+	mk = &p->masks[(size_t)unit * POLICY_WAY * p->nmask_words];
+	if (p->nprobe == 1) {
 		u32 w0 = sub & (POLICY_WAY - 1);
 
 		eq = (sl[w0].target == t);
-		bit = mask_bit(&mk[(size_t)w0 * g_nmask_words], cid);
+		bit = mask_bit(&mk[(size_t)w0 * p->nmask_words], cid, p);
 		hit = eq & bit & (cid != POLICY_ID_NONE);
 		wild = eq & (sl[w0].repl_k >> 15);
 		rk = eq ? (sl[w0].repl_k & ((1u << POLICY_REPL_BITS) - 1)) : 0;
 	} else {
-		for (k = 0; k < g_nprobe; k++) {
+		for (k = 0; k < p->nprobe; k++) {
 			u32 pos = (sub + k) & (POLICY_WAY - 1);
 	
 			eq = (sl[pos].target == t);
-			bit = mask_bit(&mk[(size_t)pos * g_nmask_words], cid);
+			bit = mask_bit(&mk[(size_t)pos * p->nmask_words], cid, p);
 	
 			hit |= eq & bit & (cid != POLICY_ID_NONE);
 			wild |= eq & (sl[pos].repl_k >> 15);
@@ -626,7 +674,7 @@ static __always_inline u32 policy_lookup_fast(uid_t caller, uid_t target)
 			}
 
 	repl = (hit | wild) ? (POLICY_REPL_BASE + rk) : 0;
-	read_unlock_irqrestore(&policy_lock, flags);
+	rcu_read_unlock();
 
 	return repl;
 }
@@ -640,16 +688,7 @@ EXPORT_SYMBOL_GPL(policy_lookup);
 
 static void policy_reset(void)
 {
-	g_tgt = dummy_tgt;
-	g_masks = dummy_masks;
-	g_cid = dummy_cid;
-	g_nlines = POLICY_MIN_LINES;
-	g_shift = 32 - ilog2(POLICY_MIN_LINES);
-	g_nmask_words = 1;
-	g_nprobe = POLICY_WAY;
-	g_npairs = 0;
-	g_ncallers = 0;
-	g_mirror = 0;
+	policy_publish(&g_empty);
 }
 
 int policy_init(void)
@@ -660,11 +699,5 @@ int policy_init(void)
 
 void policy_free(void)
 {
-	if (g_tgt != dummy_tgt)
-		kfree(g_tgt);
-	if (g_masks != dummy_masks)
-		kfree(g_masks);
-	if (g_cid != dummy_cid)
-		kfree(g_cid);
-	policy_reset();
+	policy_publish(&g_empty);
 }

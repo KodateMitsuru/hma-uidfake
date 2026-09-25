@@ -7,7 +7,6 @@
 
 static int __init uidfake_init(void)
 {
-	rwlock_init(&policy_lock);
 	if (policy_init())
 		return -ENOMEM;
 

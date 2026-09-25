@@ -4,7 +4,6 @@
 
 #include <linux/types.h>
 #include <linux/sched.h>
-#include <linux/rwlock.h>
 #include <linux/uidgid.h>
 
 #define POLICY_MAX_PAIRS 4096
@@ -28,15 +27,12 @@
 #define POLICY_ID_NONE     0xffffffffu
 #define POLICY_APP_ID_MIN  10000u	/* app uids: 10000 + appid + user * 100000 */
 #define POLICY_APP_ID_SPAN 10000u
-#define POLICY_CID_SLOTS   16384u	/* power of two: the index is masked, never clamped */
 #define POLICY_WILD_FLAG   (1u << 15)	/* slot flag: "hide from any caller" */
 
 /*
  * The uid hash is not hardcoded here on purpose: policy.c reads the formula the
  * running kernel actually uses back from find_user() at policy-apply time.
  */
-
-extern rwlock_t policy_lock;
 
 struct uid_pair {	/* 8 bytes: POLICY_WAY of them fill one cache line */
 	u32 target;
