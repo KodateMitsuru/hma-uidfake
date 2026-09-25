@@ -39,7 +39,7 @@ static u32  g_mirror;
  */
 static struct uid_pair dummy_tgt[POLICY_MIN_LINES * POLICY_WAY];
 static u64 dummy_masks[POLICY_MIN_LINES * POLICY_WAY];
-static u16 dummy_cid[POLICY_CID_SLOTS];
+static u16 dummy_cid[POLICY_APP_ID_SPAN];
 
 struct apply_pair { u32 caller; u32 target; };
 
@@ -236,10 +236,10 @@ static int layout_cids(struct layout *l, const u32 *hid, u32 nh)
 {
 	u32 i;
 
-	l->cid = kmalloc_array(POLICY_CID_SLOTS, sizeof(*l->cid), GFP_KERNEL);
+	l->cid = kmalloc_array(POLICY_APP_ID_SPAN, sizeof(*l->cid), GFP_KERNEL);
 	if (!l->cid)
 		return -1;
-	for (i = 0; i < POLICY_CID_SLOTS; i++)
+	for (i = 0; i < POLICY_APP_ID_SPAN; i++)
 		l->cid[i] = 0xffffu;
 	for (i = 0; i < nh; i++) {
 		u32 app = hid[i] % 100000u;
@@ -548,11 +548,11 @@ static u32 policy_index_mode(u32 target, u32 mirror, u32 shift)
  */
 static u32 caller_id(u32 caller)
 {
-	u32 app = caller % 100000u;
-	u32 off = app - POLICY_APP_ID_MIN;
-	u32 id = g_cid[off & (POLICY_CID_SLOTS - 1)];
+	u32 off = (caller % 100000u) - POLICY_APP_ID_MIN;
+	u32 in = off < POLICY_APP_ID_SPAN;
+	u32 id = g_cid[in ? off : 0];	/* one load either way */
 
-	return (off < POLICY_APP_ID_SPAN) && id != 0xffffu ? id : POLICY_ID_NONE;
+	return (in && id != 0xffffu) ? id : POLICY_ID_NONE;
 }/*
  * The caller's bit in a mask. One word covers up to 64 callers, which is the normal case, and
  * then this is a single load and shift; otherwise every word is read and the bit is sampled
@@ -581,7 +581,7 @@ static __always_inline u32 policy_lookup_fast(uid_t caller, uid_t target)
 {
 	unsigned long flags;
 	u32 c = (u32)caller, t = (u32)target;
-	u32 cid, repl = 0, hit = 0, wild = 0, rk = 0, k, unit, sub, eq, bit;
+	u32 cid, repl = 0, hit = 0, wild = 0, rk = 0, k, unit, sub, eq, bit, h;
 	const struct uid_pair *sl;
 	const u64 *mk;
 
@@ -589,21 +589,42 @@ static __always_inline u32 policy_lookup_fast(uid_t caller, uid_t target)
 		return 0;
 
 	read_lock_irqsave(&policy_lock, flags);
-	cid = caller_id(c);
-	unit = policy_index_mode(t, g_mirror, g_shift);
+		cid = caller_id(c);
+	/*
+	 * One hash for both the line and the slot inside it: the kernel's own uid hash gives
+	 * the bucket line directly (8 buckets per line) and its low bits give the starting
+	 * slot, so the hot path hashes the target once instead of twice.
+	 */
+	h = policy_bucket(t, g_hash.bits, (u32)g_hash.multiply);
+	sub = h & (POLICY_WAY - 1);
+	{
+		u32 mir = h >> 3, own = policy_index_own(t, g_shift), m = (u32)0 - g_mirror;
+
+		unit = (mir & m) | (own & ~m);
+	}
 	sl = &g_tgt[(size_t)unit * POLICY_WAY];
 	mk = &g_masks[(size_t)unit * POLICY_WAY * g_nmask_words];
-	sub = policy_subslot(t);
-	for (k = 0; k < g_nprobe; k++) {
-		u32 pos = (sub + k) & (POLICY_WAY - 1);
+	if (g_nprobe == 1) {
+		u32 w0 = sub & (POLICY_WAY - 1);
 
-		eq = (sl[pos].target == t);
-		bit = mask_bit(&mk[(size_t)pos * g_nmask_words], cid);
+		eq = (sl[w0].target == t);
+		bit = mask_bit(&mk[(size_t)w0 * g_nmask_words], cid);
+		hit = eq & bit & (cid != POLICY_ID_NONE);
+		wild = eq & (sl[w0].repl_k >> 15);
+		rk = eq ? (sl[w0].repl_k & ((1u << POLICY_REPL_BITS) - 1)) : 0;
+	} else {
+		for (k = 0; k < g_nprobe; k++) {
+			u32 pos = (sub + k) & (POLICY_WAY - 1);
+	
+			eq = (sl[pos].target == t);
+			bit = mask_bit(&mk[(size_t)pos * g_nmask_words], cid);
+	
+			hit |= eq & bit & (cid != POLICY_ID_NONE);
+			wild |= eq & (sl[pos].repl_k >> 15);
+			rk |= eq ? (sl[pos].repl_k & ((1u << POLICY_REPL_BITS) - 1)) : 0;
+		}
+			}
 
-		hit |= eq & bit & (cid != POLICY_ID_NONE);
-		wild |= eq & (sl[pos].repl_k >> 15);
-		rk |= eq ? (sl[pos].repl_k & ((1u << POLICY_REPL_BITS) - 1)) : 0;
-	}
 	repl = (hit | wild) ? (POLICY_REPL_BASE + rk) : 0;
 	read_unlock_irqrestore(&policy_lock, flags);
 
