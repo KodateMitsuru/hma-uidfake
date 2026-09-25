@@ -6,8 +6,10 @@
 #include <cstring>
 #include <ranges>
 
+#include <dlfcn.h>
 #include <poll.h>
 #include <sys/inotify.h>
+#include <sys/system_properties.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
@@ -17,6 +19,46 @@ namespace {
 /* /data/system is noisy; only packages.* events matter there. */
 constexpr std::string_view kPackagesPrefix = "packages.";
 
+/*
+ * Android's own "this user's credential-encrypted storage is open" flag, set after the first
+ * unlock. /data/user/0 appears through a vold mount and inotify cannot report a mount, so this
+ * is what turns the unlock into an immediate event instead of a poll guess.
+ */
+[[nodiscard]] bool ce_available() {
+    char value[PROP_VALUE_MAX] = {};
+    return __system_property_get("sys.user.0.ce_available", value) > 0 && value[0] == 't';
+}
+
+/*
+ * There is no file descriptor to poll for a property, so before the unlock - when there is
+ * nothing to watch and nothing readable anyway - block on the property itself instead of
+ * waking up every second. Returns whether the storage is open now.
+ */
+using PropWait = int (*)(const prop_info *, std::uint32_t, std::uint32_t *, const timespec *);
+
+[[nodiscard]] bool wait_for_unlock() {
+    if (ce_available())
+        return true;
+
+    /*
+     * __system_property_wait() is exported by the platform libc but not by the NDK stubs, so it
+     * is resolved at run time; a 5 s slice only matters if the property never changes at all.
+     */
+    static const auto wait_fn = reinterpret_cast<PropWait>(::dlsym(RTLD_DEFAULT, "__system_property_wait"));
+    const prop_info *info = __system_property_find("sys.user.0.ce_available");
+    constexpr int kSliceSeconds = 5;
+
+    if (wait_fn && info) {
+        const std::uint32_t serial = __system_property_serial(info);
+        std::uint32_t fresh = serial;
+        timespec slice{ .tv_sec = kSliceSeconds, .tv_nsec = 0 };
+        wait_fn(info, serial, &fresh, &slice);
+    } else {
+        ::sleep(kSliceSeconds);
+    }
+    return ce_available();
+}
+
 constexpr std::uint32_t kFileEvents =
     IN_MODIFY | IN_CLOSE_WRITE | IN_ATTRIB | IN_MOVE_SELF | IN_DELETE_SELF;
 constexpr std::uint32_t kDirEvents =
@@ -25,8 +67,7 @@ constexpr std::uint32_t kDirEvents =
 }  // namespace
 
 bool Watcher::open(const std::filesystem::path &config,
-                   const std::filesystem::path &packages_list,
-                   const std::filesystem::path &packages_xml) {
+                   const std::filesystem::path &packages_list) {
     inotify_.reset(::inotify_init1(IN_CLOEXEC | IN_NONBLOCK));
     if (!inotify_.valid()) {
         Log::warn("inotify_init1: {}", std::strerror(errno));
@@ -49,7 +90,6 @@ bool Watcher::open(const std::filesystem::path &config,
         { .path = config, .mask = kFileEvents },
         { .path = config.parent_path(), .mask = kDirEvents },
         { .path = packages_list, .mask = kFileEvents },
-        { .path = packages_xml, .mask = kFileEvents },
         { .path = "/data/system", .mask = kDirEvents },
     };
     apply_watches();
@@ -173,11 +213,34 @@ std::optional<Watcher::Tick> Watcher::wait() {
             { .fd = resync_.get(), .events = POLLIN, .revents = 0 },
         }};
 
-        if (::poll(fds.data(), fds.size(), -1) < 0) {
+        /*
+         * Before the unlock there is nothing to watch and nothing to read, so wait on the
+         * property instead of waking up every second. ce_ has to be updated here: returning
+         * without it made the caller come straight back and spin.
+         */
+        if (!ce_) {
+            if (!wait_for_unlock())
+                continue;
+            ce_ = true;
+            Log::info("credential storage is open (device unlocked)");
+            return Tick::Resync;
+        }
+
+        /* After the unlock a one second tick doubles as the closure check. */
+        const int ready = ::poll(fds.data(), fds.size(), 1000);
+        if (ready < 0) {
             if (errno == EINTR)
                 continue;
             Log::warn("poll: {}", std::strerror(errno));
             return std::nullopt;
+        }
+        if (ready == 0) {
+            if (!ce_available()) {
+                ce_ = false;
+                Log::info("credential storage closed");
+                return Tick::Resync;
+            }
+            continue;
         }
         if (fds[0].revents != 0 && handle_inotify_events())
             arm_debounce();

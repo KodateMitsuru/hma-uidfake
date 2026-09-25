@@ -48,10 +48,8 @@ std::optional<HmaPolicy> HmaPolicy::load(const std::filesystem::path &path) {
     nlohmann::json config;
     try {
         std::ifstream in(path);
-        if (!in) {
-            Log::warn("cannot read {} (will retry on the next event)", path.string());
-            return std::nullopt;
-        }
+        if (!in)
+            return std::nullopt;   /* sync_now() reports the outage once */
         in >> config;
     } catch (const std::exception &e) {
         Log::warn("cannot parse {}: {}", path.string(), e.what());

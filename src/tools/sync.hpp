@@ -14,7 +14,6 @@ namespace uidfake {
 struct Config {
     std::filesystem::path config = "/data/user/0/com.tsng.hidemyapplist/files/config.json";
     std::filesystem::path packages_list = "/data/system/packages.list";
-    std::filesystem::path packages_xml = "/data/system/packages.xml";
     bool once = false;
 };
 
@@ -37,6 +36,7 @@ public:
 
 private:
     Config config_;
+    bool config_refused_ = false;
     NetlinkClient netlink_;
     Watcher watcher_;
 };

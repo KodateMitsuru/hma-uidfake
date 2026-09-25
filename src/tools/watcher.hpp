@@ -40,8 +40,7 @@ public:
     static constexpr auto kResyncPending = std::chrono::seconds{ 10 };
 
     [[nodiscard]] bool open(const std::filesystem::path &config,
-                            const std::filesystem::path &packages_list,
-                            const std::filesystem::path &packages_xml);
+                            const std::filesystem::path &packages_list);
 
     /* Blocks until something worth resyncing happens; nullopt if polling broke. */
     [[nodiscard]] std::optional<Tick> wait();
@@ -70,6 +69,7 @@ private:
     std::vector<Watch> watches_;   /* what inotify actually gave us */
     std::vector<Watch> desired_;   /* what we want, whether or not it exists yet */
     std::optional<std::chrono::steady_clock::time_point> pending_;   /* burst in progress */
+    bool ce_ = false;   /* sys.user.0.ce_available as last seen */
 };
 
 }  // namespace uidfake

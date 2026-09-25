@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "packages.hpp"
 
+#include <array>
 #include <fstream>
-#include <regex>
 #include <sstream>
 #include <string>
 
@@ -25,27 +25,41 @@ std::optional<std::uint32_t> parse_uid(std::string_view text) {
     return static_cast<std::uint32_t>(value);
 }
 
-std::set<std::string, std::less<>> read_system_apps(const std::filesystem::path &path) {
+/*
+ * "Is this a system app?" without packages.xml. On Android 12+ that file is binary XML (it
+ * starts with ABX), so a text parser reads nothing at all and the answer silently became "no
+ * app is a system app" - which quietly disabled excludeSystemApps. packages.list does carry
+ * the seapp seinfo, and the honest proxy for ApplicationInfo.FLAG_SYSTEM is the "partition="
+ * tag MIUI appends to the seinfo of anything whose code lives on a system partition.
+ *
+ * It has to be that tag and not the label: on this ROM 290 of 514 packages (nearly every
+ * preinstalled app) are labelled "platform", so matching that would call almost everything a
+ * system app. Apps on shared system uids never reach this check: the policy drops any uid
+ * below 10000 by itself.
+ */
+std::set<std::string, std::less<>> read_system_apps(const std::filesystem::path &list_path) {
     std::set<std::string, std::less<>> result;
-    std::ifstream in(path);
+    std::ifstream in(list_path);
     if (!in)
         return result;
 
-    const std::string text{ std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>() };
-    const std::regex entry(R"re(<package[^>]*name="([^"]+)"[^>]*flags="([0-9]+)")re");
-    for (auto it = std::sregex_iterator(text.begin(), text.end(), entry);
-         it != std::sregex_iterator(); ++it) {
-        const auto flags = std::stoul((*it)[2].str());
-        if (flags & 1UL)  /* ApplicationInfo.FLAG_SYSTEM */
-            result.insert((*it)[1].str());
+    /* Set for anything installed on /system, /system_ext, /product or /vendor. */
+    constexpr std::string_view kPartitionTag = "partition=";
+    std::string line;
+    while (std::getline(in, line)) {
+        std::istringstream fields(line);
+        std::string name, uid, debug, data_dir, seinfo;
+        if (!(fields >> name >> uid >> debug >> data_dir >> seinfo))
+            continue;
+        if (seinfo.find(kPartitionTag) != std::string::npos)
+            result.insert(std::move(name));
     }
     return result;
 }
 
 }  // namespace
 
-std::optional<PackageDb> PackageDb::load(const std::filesystem::path &list_path,
-                                        const std::filesystem::path &xml_path) {
+std::optional<PackageDb> PackageDb::load(const std::filesystem::path &list_path) {
     PackageDb db;
     std::ifstream in(list_path);
     if (!in)
@@ -70,7 +84,12 @@ std::optional<PackageDb> PackageDb::load(const std::filesystem::path &list_path,
     if (malformed > 0)
         Log::warn("packages.list: {} unparsable line(s)", malformed);
 
-    db.system_apps_ = read_system_apps(xml_path);
+    db.system_apps_ = read_system_apps(list_path);
+    if (db.system_apps_.empty())
+        Log::warn("no system packages recognised in {}; excludeSystemApps will do nothing",
+                  list_path.string());
+    else
+        Log::info("{} system app(s) recognised", db.system_apps_.size());
     return db;
 }
 

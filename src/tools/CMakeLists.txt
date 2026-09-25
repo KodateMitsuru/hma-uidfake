@@ -17,7 +17,7 @@ add_executable(sync-tool
     netlink.cpp
     hma.cpp
     packages.cpp)
-target_link_libraries(sync-tool PRIVATE nlohmann_json::nlohmann_json)
+target_link_libraries(sync-tool PRIVATE nlohmann_json::nlohmann_json dl)
 target_compile_options(sync-tool PRIVATE -O2 -Wall -Wextra)
 target_link_options(sync-tool PRIVATE -static -s)
 

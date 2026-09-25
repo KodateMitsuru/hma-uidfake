@@ -12,13 +12,12 @@
 namespace uidfake {
 
 /*
- * The package manager's view: uid per package name (/data/system/packages.list) plus the
- * set of system packages (FLAG_SYSTEM from packages.xml).
+ * The package manager's view: uid per package name and the system-app set, both taken from
+ * /data/system/packages.list (packages.xml is binary XML on Android 12+ and no longer read).
  */
 class PackageDb {
 public:
-    [[nodiscard]] static std::optional<PackageDb> load(const std::filesystem::path &list_path,
-                                                      const std::filesystem::path &xml_path);
+    [[nodiscard]] static std::optional<PackageDb> load(const std::filesystem::path &list_path);
 
     [[nodiscard]] std::optional<std::uint32_t> uid_of(std::string_view name) const;
     [[nodiscard]] bool is_system(std::string_view name) const;

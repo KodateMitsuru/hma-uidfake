@@ -43,11 +43,9 @@ std::optional<Config> parse_args(int argc, char **argv) {
             config.config = argv[++i];
         } else if (arg == "--list" && has_value) {
             config.packages_list = argv[++i];
-        } else if (arg == "--xml" && has_value) {
-            config.packages_xml = argv[++i];
         } else {
             std::fprintf(stderr,
-                         "usage: %s [--once] [--config <json>] [--list <packages.list>] [--xml <packages.xml>]\n",
+                         "usage: %s [--once] [--config <json>] [--list <packages.list>]\n",
                          argc > 0 ? argv[0] : "sync-tool");
             return std::nullopt;
         }
@@ -59,11 +57,19 @@ std::optional<Config> parse_args(int argc, char **argv) {
 void Syncer::sync_now() {
     const auto policy = HmaPolicy::load(config_.config);
     if (!policy) {
-        Log::warn("cannot read {} (keeping the previous policy)", config_.config.string());
+        /* Once per outage: before the unlock this used to repeat on every tick. */
+        if (!config_refused_) {
+            config_refused_ = true;
+            Log::warn("cannot read {} yet (keeping the previous policy)", config_.config.string());
+        }
         return;
     }
+    if (config_refused_) {
+        config_refused_ = false;
+        Log::info("{} is readable again", config_.config.string());
+    }
 
-    const auto packages = PackageDb::load(config_.packages_list, config_.packages_xml);
+    const auto packages = PackageDb::load(config_.packages_list);
     if (!packages) {
         Log::warn("cannot read {} (will retry on the next event)", config_.packages_list.string());
         return;
@@ -80,7 +86,7 @@ bool Syncer::run() {
     if (config_.once)
         return true;
 
-    if (!watcher_.open(config_.config, config_.packages_list, config_.packages_xml))
+    if (!watcher_.open(config_.config, config_.packages_list))
         return false;
     Log::info("watching {}", config_.config.string());
 
