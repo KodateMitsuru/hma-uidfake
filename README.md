@@ -8,8 +8,8 @@ ioprio_get(IOPRIO_WHO_USER, uid)  -> -EINVAL
 setpriority / ioprio_set          -> same
 ```
 
-`sync-tool` is the only userspace component. It watches HMA's `config.json` and the
-package manager files (`packages.list`, `packages.xml`) with fsnotify, evaluates HMA's
+`sync-tool` is the only userspace component. It watches HMA's `config.json` and
+`/data/system/packages.list` with fsnotify, evaluates HMA's
 hiding rules into `(caller, target)` pairs and pushes them to the module over generic
 netlink (family `kaux`). The kernel side never reads files, never parses JSON and has no
 module parameters.

@@ -2,7 +2,7 @@
 /*
  * netlink.c - policy injection channel from privileged userspace into the kernel.
  *
- * Protocol (little endian, matches src/tools/sync-tool.cpp):
+ * Protocol (little endian, matches src/tools/netlink.cpp):
  *   KAUX_CMD_SET:  attr KAUX_ATTR_BLOB = u32 npairs, then npairs * (caller, target)
  *                  caller == 0 means "any caller"
  *   KAUX_CMD_PING: no payload, ACK only
