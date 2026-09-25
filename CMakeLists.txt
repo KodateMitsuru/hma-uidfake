@@ -49,6 +49,7 @@ set(SRC_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/main.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/hooks.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/policy.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/patch.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/netlink.c
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include/uidfake.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/include/kmi_compat.h

@@ -4,66 +4,268 @@
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/module.h>
+#include <linux/resource.h>
 #include <linux/sched.h>
+#include <linux/string.h>
+#include <linux/syscalls.h>
 #include <linux/user.h>
 #include <linux/uidgid.h>
 
 #include "uidfake.h"
 
-/* find_user(kuid_t uid) takes the uid in the argument register x0. */
-#define ARG_UID 0
+/* one translation unit with the policy: policy_lookup() is on the hot path and the compiler
+ * can then inline it into the syscall wrappers instead of paying a call for every query */
+#include "policy.c"
+
+#define ARG_UID 0	/* find_user(kuid_t uid): uid in x0 */
+#define ARG_WHO 1	/* getpriority/setpriority/ioprio_get/ioprio_set: (which, who, ...) */
+
+/* syscall_fn_t is not declared for every KMI the module builds against */
+typedef long (*uidfake_syscall_t)(const struct pt_regs *);
+
+struct hook_entry {
+	unsigned nr;
+	uidfake_syscall_t ours;
+	uidfake_syscall_t orig;
+};
 
 /*
- * The probe sits on find_user(kuid_t uid), uid in x0:
- *  - __arm64_sys_* has no separate entry symbol (the body is inlined), and rewriting the
- *    argument in pt_regs would leave the tampered value visible to /proc/<tid>/syscall and
- *    ptrace for the whole syscall;
- *  - find_user() is the first place the uid exists as a plain register, is exported, and is
- *    called by the uid branches of getpriority/setpriority/ioprio_get/ioprio_set only;
- *  - nothing has to be restored afterwards, so there is no kretprobe.
- * The caller then takes its own "no such user" path, exactly like for an absent uid.
+ * Only data is patched, never an instruction: the syscall table entries are indirect calls, so
+ * there is no branch range to worry about (a module region is farther from the image than a bl
+ * can reach), no BTI landing pad and no PAC prologue. A wrapper never touches the task's
+ * pt_regs either -- it copies it, substitutes the uid in the copy and runs the real wrapper
+ * with that, so find_user() fails exactly like for a uid that does not exist while
+ * /proc/<tid>/syscall, ptrace and the syscall-exit stop keep seeing the original argument.
+ *
+ * This is the mechanism KernelSU uses. Fallback: if the table cannot be resolved or patched,
+ * the verified kprobe hook is registered instead.
  */
 
-static int hook_pre(struct kprobe *kp, struct pt_regs *regs) {
-  u64 orig = regs->regs[ARG_UID];
-  u32 target = (u32)orig;
-  u32 caller = (u32)__kuid_val(current_fsuid());
-  u32 repl = 0;
-  u64 cand, val;
+asmlinkage long uidfake_getpriority(const struct pt_regs *regs);
+asmlinkage long uidfake_setpriority(const struct pt_regs *regs);
+asmlinkage long uidfake_ioprio_get(const struct pt_regs *regs);
+asmlinkage long uidfake_ioprio_set(const struct pt_regs *regs);
 
-  /* one consult for every query, so a caller always pays the same price */
-  repl = policy_lookup(caller, target);
+static struct hook_entry g_hook[] = {
+	{ __NR_getpriority, uidfake_getpriority, NULL },
+	{ __NR_setpriority, uidfake_setpriority, NULL },
+	{ __NR_ioprio_get, uidfake_ioprio_get, NULL },
+	{ __NR_ioprio_set, uidfake_ioprio_set, NULL },
+};
 
-  /* replacement in the low 32 bits, the upper half of the register left untouched */
-  cand = (orig & ~0xffffffffULL) | (u64)repl;
+/*
+ * AArch32 binaries go through compat_sys_call_table with the ARM (EABI) numbers. They are
+ * stable ABI constants: getpriority/setpriority are 141/140 in both tables, ioprio is not
+ * (314/315 here against 31/30 in the 64-bit generic table).
+ */
+#ifdef CONFIG_COMPAT
+#define NR32_GETPRIORITY 141
+#define NR32_SETPRIORITY 140
+#define NR32_IOPRIO_SET  314
+#define NR32_IOPRIO_GET  315
 
-  /* one cmp + csel: hit and miss execute the same instruction stream */
-  asm("cmp\t%w[r], #0\n\tcsel\t%[v], %[c], %[o], ne"
-      : [v] "=r"(val)
-      : [r] "r"(repl), [c] "r"(cand), [o] "r"(orig)
-      : "cc");
+asmlinkage long uidfake32_getpriority(const struct pt_regs *regs);
+asmlinkage long uidfake32_setpriority(const struct pt_regs *regs);
+asmlinkage long uidfake32_ioprio_get(const struct pt_regs *regs);
+asmlinkage long uidfake32_ioprio_set(const struct pt_regs *regs);
 
-  regs->regs[ARG_UID] = val;
-  return 0;
+static struct hook_entry g_chook[] = {
+	{ NR32_GETPRIORITY, uidfake32_getpriority, NULL },
+	{ NR32_SETPRIORITY, uidfake32_setpriority, NULL },
+	{ NR32_IOPRIO_GET, uidfake32_ioprio_get, NULL },
+	{ NR32_IOPRIO_SET, uidfake32_ioprio_set, NULL },
+};
+#endif
+
+/*
+ * Substitute the uid argument when the policy hides it, then run the real wrapper.
+ *
+ * Only the argument registers are copied: the generated __arm64_sys_* wrappers read exactly
+ * regs[0..2] (which/who/prio) and never pass the pt_regs on, so the rest of the copy is never
+ * touched. The copy is unconditional and the substituted value is selected with csel, so a
+ * hidden uid and a uid that does not exist execute the same instruction stream -- only the
+ * register value differs. The task's own pt_regs is never modified, so /proc/<tid>/syscall,
+ * ptrace and the syscall-exit stop keep seeing the original argument.
+ */
+static asmlinkage long uid_hook(const struct pt_regs *regs, unsigned which_user,
+				uidfake_syscall_t orig)
+{
+	struct pt_regs copy;
+	u32 repl;
+
+	copy.regs[0] = regs->regs[0];
+	copy.regs[1] = regs->regs[1];
+	copy.regs[2] = regs->regs[2];
+	if ((u32)regs->regs[0] != which_user)
+		return orig(regs);
+
+	repl = policy_lookup_fast((u32)__kuid_val(current_fsuid()), (u32)regs->regs[ARG_WHO]);
+	copy.regs[ARG_WHO] = repl ? (u64)repl : regs->regs[ARG_WHO];
+	return orig(&copy);
 }
 
-static struct kprobe g_user_probe;
-
-int hooks_install(void) {
-  int ret;
-
-  memset(&g_user_probe, 0, sizeof(g_user_probe));
-  g_user_probe.symbol_name = "find_user";
-  g_user_probe.pre_handler = hook_pre;
-
-  ret = register_kprobe(&g_user_probe);
-  if (ret < 0) {
-    pr_warn("uidfake: kprobe find_user failed: %d\n", ret);
-    return 0;
-  }
-
-  pr_info("uidfake: find_user (uid in x%u)\n", ARG_UID);
-  return 1;
+asmlinkage long uidfake_getpriority(const struct pt_regs *regs)
+{
+	return uid_hook(regs, PRIO_USER, g_hook[0].orig);
 }
 
-void hooks_remove(void) { unregister_kprobe(&g_user_probe); }
+asmlinkage long uidfake_setpriority(const struct pt_regs *regs)
+{
+	return uid_hook(regs, PRIO_USER, g_hook[1].orig);
+}
+
+asmlinkage long uidfake_ioprio_get(const struct pt_regs *regs)
+{
+	return uid_hook(regs, IOPRIO_WHO_USER, g_hook[2].orig);
+}
+
+asmlinkage long uidfake_ioprio_set(const struct pt_regs *regs)
+{
+	return uid_hook(regs, IOPRIO_WHO_USER, g_hook[3].orig);
+}
+
+#ifdef CONFIG_COMPAT
+asmlinkage long uidfake32_getpriority(const struct pt_regs *regs)
+{
+	return uid_hook(regs, PRIO_USER, g_chook[0].orig);
+}
+
+asmlinkage long uidfake32_setpriority(const struct pt_regs *regs)
+{
+	return uid_hook(regs, PRIO_USER, g_chook[1].orig);
+}
+
+asmlinkage long uidfake32_ioprio_get(const struct pt_regs *regs)
+{
+	return uid_hook(regs, IOPRIO_WHO_USER, g_chook[2].orig);
+}
+
+asmlinkage long uidfake32_ioprio_set(const struct pt_regs *regs)
+{
+	return uid_hook(regs, IOPRIO_WHO_USER, g_chook[3].orig);
+}
+#endif
+
+/* ---- kprobe fallback ---- */
+
+static int hook_pre(struct kprobe *kp, struct pt_regs *regs)
+{
+	u64 orig = regs->regs[ARG_UID];
+	u32 repl = policy_lookup((u32)__kuid_val(current_fsuid()), (u32)orig);
+	u64 cand, val;
+
+	cand = (orig & ~0xffffffffULL) | (u64)repl;
+
+	/* one cmp + csel: hit and miss execute the same instruction stream */
+	asm("cmp\t%w[r], #0\n\tcsel\t%[v], %[c], %[o], ne"
+	    : [v] "=r"(val)
+	    : [r] "r"(repl), [c] "r"(cand), [o] "r"(orig)
+	    : "cc");
+
+	regs->regs[ARG_UID] = val;
+	return 0;
+}
+
+static struct kprobe g_probe;
+
+/* ---- table patching ---- */
+
+static uidfake_syscall_t *main_table;
+#ifdef CONFIG_COMPAT
+static uidfake_syscall_t *compat_table;
+#endif
+
+static unsigned patch_entries(uidfake_syscall_t *table, struct hook_entry *e, unsigned n)
+{
+	unsigned i;
+
+	for (i = 0; i < n; i++) {
+		uidfake_syscall_t *slot = &table[e[i].nr];
+
+		e[i].orig = slot[0];
+		if (uidfake_patch_text(slot, &e[i].ours, sizeof(uidfake_syscall_t), true) ||
+		    slot[0] != e[i].ours) {
+			pr_warn("uidfake: patching syscall %u failed\n", e[i].nr);
+			return 0;
+		}
+	}
+	return n;
+}
+
+static void unpatch_entries(uidfake_syscall_t *table, struct hook_entry *e, unsigned n)
+{
+	unsigned i;
+
+	if (!table)
+		return;
+	for (i = 0; i < n; i++) {
+		if (e[i].orig)
+			uidfake_patch_text(&table[e[i].nr], &e[i].orig,
+					   sizeof(uidfake_syscall_t), true);
+		e[i].orig = NULL;
+	}
+}
+
+static int patch_tables(void)
+{
+	unsigned long table = uidfake_lookup("sys_call_table");
+	unsigned n;
+
+	if (!table || uidfake_patch_init())
+		return -ENOENT;
+	pr_info("uidfake: sys_call_table=%px locator check: find_user=%px linked=%px\n",
+		(void *)table, (void *)uidfake_lookup("find_user"), (void *)find_user);
+
+	main_table = (uidfake_syscall_t *)table;
+	n = patch_entries(main_table, g_hook, ARRAY_SIZE(g_hook));
+	if (n != ARRAY_SIZE(g_hook)) {
+		unpatch_entries(main_table, g_hook, ARRAY_SIZE(g_hook));
+		return -EIO;
+	}
+	pr_info("uidfake: %u uid syscall(s) hooked in sys_call_table\n", n);
+
+#ifdef CONFIG_COMPAT
+	table = uidfake_lookup("compat_sys_call_table");
+	if (table) {
+		compat_table = (uidfake_syscall_t *)table;
+		n = patch_entries(compat_table, g_chook, ARRAY_SIZE(g_chook));
+		if (n != ARRAY_SIZE(g_chook)) {
+			unpatch_entries(compat_table, g_chook, ARRAY_SIZE(g_chook));
+			pr_warn("uidfake: 32-bit compat table not hooked; 32-bit callers are uncovered\n");
+		} else {
+			pr_info("uidfake: %u uid syscall(s) hooked in compat_sys_call_table\n", n);
+		}
+	}
+#endif
+	return 0;
+}
+
+int hooks_install(void)
+{
+	if (!patch_tables())
+		return 1;
+
+	memset(&g_probe, 0, sizeof(g_probe));
+	g_probe.symbol_name = "find_user";
+	g_probe.pre_handler = hook_pre;
+	if (register_kprobe(&g_probe) < 0) {
+		pr_warn("uidfake: no hook could be installed\n");
+		return 0;
+	}
+	pr_info("uidfake: fallback kprobe on find_user (uid in x%d)\n", ARG_UID);
+	return 1;
+}
+
+void hooks_remove(void)
+{
+	if (main_table) {
+		unpatch_entries(main_table, g_hook, ARRAY_SIZE(g_hook));
+#ifdef CONFIG_COMPAT
+		unpatch_entries(compat_table, g_chook, ARRAY_SIZE(g_chook));
+		compat_table = NULL;
+#endif
+		main_table = NULL;
+		return;
+	}
+	unregister_kprobe(&g_probe);
+}

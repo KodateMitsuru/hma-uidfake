@@ -30,7 +30,7 @@ KBUILD_ARGS := M=$(MDIR)
 endif
 
 obj-m += hma_uidfake.o
-hma_uidfake-objs := main.o hooks.o policy.o netlink.o
+hma_uidfake-objs := main.o patch.o hooks.o  netlink.o
 
 ifneq ($(LSE_HDR),)
 ccflags-y += -include $(MDIR)/include/kmi_compat.h
