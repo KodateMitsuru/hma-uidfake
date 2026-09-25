@@ -14,28 +14,16 @@
 #define ARG_UID 0
 
 /*
- * The probe sits on find_user() rather than on the syscall entry, for a reason that only
- * shows when you look at what is observable:
- *
- *  - __arm64_sys_getpriority() and friends keep the arguments in the syscall's pt_regs,
- *    and arm64 has no separate in-register entry (there is no __do_sys_ or __se_sys_
- *    symbol on arm64 -- the body is inlined into the __arm64_sys_ wrapper). Rewriting
- *    argument there leaves the tampered value sitting in pt_regs for the whole syscall,
- *    where /proc/<tid>/syscall, ptrace register reads and syscall-exit stops can see it.
- *
- *  - find_user() is the first place the uid exists as a plain register argument, and it
- *    is exported. Substituting the uid here leaves the syscall's own pt_regs untouched:
- *    external observers only ever see the original argument and there is nothing to
- *    restore, so no return handler is needed at all.
- *
- * Coverage: getpriority(PRIO_USER), setpriority(PRIO_USER), ioprio_get(IOPRIO_WHO_USER)
- * and ioprio_set(IOPRIO_WHO_USER) all call find_user() for their uid branch, while their
- * pid/pgrp branches never do -- so the pid paths stay untouched without a `which` check.
- *
- * The caller then runs its own "user does not exist" path: find_user() returns NULL and
- * the syscall takes its miss branch (`if (!user) goto out_unlock`), exactly like a uid
- * that really does not exist.
+ * The probe sits on find_user(kuid_t uid), uid in x0:
+ *  - __arm64_sys_* has no separate entry symbol (the body is inlined), and rewriting the
+ *    argument in pt_regs would leave the tampered value visible to /proc/<tid>/syscall and
+ *    ptrace for the whole syscall;
+ *  - find_user() is the first place the uid exists as a plain register, is exported, and is
+ *    called by the uid branches of getpriority/setpriority/ioprio_get/ioprio_set only;
+ *  - nothing has to be restored afterwards, so there is no kretprobe.
+ * The caller then takes its own "no such user" path, exactly like for an absent uid.
  */
+
 static int hook_pre(struct kprobe *kp, struct pt_regs *regs) {
   u64 orig = regs->regs[ARG_UID];
   u32 target = (u32)orig;
@@ -43,11 +31,8 @@ static int hook_pre(struct kprobe *kp, struct pt_regs *regs) {
   u32 repl = 0;
   u64 cand, val;
 
-  /*
-   * Callers that are system/root uids never take part in hiding (policy_lookup also
-   * short circuits for them), and a lookup for the caller's own uid is left alone.
-   */
-  if (caller != target) repl = policy_lookup(caller, target);
+  /* one consult for every query, so a caller always pays the same price */
+  repl = policy_lookup(caller, target);
 
   /* replacement in the low 32 bits, the upper half of the register left untouched */
   cand = (orig & ~0xffffffffULL) | (u64)repl;

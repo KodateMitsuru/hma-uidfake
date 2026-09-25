@@ -2,16 +2,14 @@
 /*
  * policy.c - the (caller, target) pairs computed in userspace.
  *
- * Two things matter here:
- *  1) the lookup cost must not depend on the result: fixed 16-step binary search plus
- *     a fixed 32-entry window scan, accumulated with masks;
- *  2) every target carries a precomputed replacement uid in the **same hash bucket** as
- *     the target: find_user() walks uid_hashtable[uid_hash(uid)], and swapping the target
- *     for a uid that hashes there but does not exist makes the lookup cost identical to a
- *     uid that genuinely does not exist (same chain, same miss). The hash is read back
- *     from find_user() itself at apply time (see detect_uid_hash()) instead of being
- *     assumed, because a vendor kernel may bucket uids differently than the module was
- *     built against.
+ * The lookup must not reveal whether a uid is hidden:
+ *  - the target's line is the kernel's own uidhash bucket line (8 bucket pointers per line),
+ *    read in full along with the masks of all its slots, so the addresses and the load
+ *    count depend on (caller, target) alone;
+ *  - the replacement uid hashes into the same bucket as the target (make_replace()), so
+ *    find_user() walks the same chain as for a uid that does not exist at all;
+ *  - the caller is matched by uid in its own table: its cost may differ between callers,
+ *    but not for one caller.
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -23,19 +21,43 @@
 
 rwlock_t policy_lock;
 
-static struct uid_pair *g_pairs;
+static struct uid_pair *g_tgt;
+static u64 *g_masks;
+static struct caller_slot *g_callers;
+static u32  g_nlines;
+static u32  g_shift;
+static u32  g_ncaller_lines;
+static u32  g_cshift;
+static u32  g_nmask_words;
 static u32  g_npairs;
-static bool g_active;
+static u32  g_ncallers;
+static u32  g_mirror;
 
-static void sort_pairs(struct uid_pair *a, u32 n)
+/*
+ * Zeroed stand-in tables, installed by policy_reset(): a lookup with no policy loaded
+ * reads them and matches nothing (target 0, no mask bits, caller uid 0), so the hot path
+ * needs no "is a policy loaded?" branch and no NULL check.
+ */
+static struct uid_pair dummy_tgt[POLICY_MIN_LINES * POLICY_WAY];
+static u64 dummy_masks[POLICY_MIN_LINES * POLICY_WAY];
+static struct caller_slot dummy_callers[POLICY_MIN_LINES * POLICY_CLINE_WAY];
+
+struct apply_pair { u32 caller; u32 target; };
+
+
+static u32 policy_hash(u32 caller, u32 target, u32 shift);
+static u32 policy_index_mode(u32 target, u32 mirror, u32 shift);
+static u32 policy_caller_line(u32 caller, u32 shift);
+
+static void sort_pairs(struct apply_pair *a, u32 n)
 {
 	u32 i, j;
 
 	for (i = 1; i < n; i++) {
-		struct uid_pair key = a[i];
+		struct apply_pair key = a[i];
 
 		for (j = i; j > 0; j--) {
-			struct uid_pair *p = &a[j - 1];
+			struct apply_pair *p = &a[j - 1];
 
 			if (p->target < key.target)
 				break;
@@ -46,19 +68,9 @@ static void sort_pairs(struct uid_pair *a, u32 n)
 		a[j] = key;
 	}
 }
-
 /*
- * Which hash does the running kernel bucket uids with?
- *
- * find_user() looks up uid_hashtable[uid_hash(uid)], and uid_hash() is a static inline
- * in kernel/user.c, so the formula is visible in find_user()'s own code. It is one of:
- *
- *   __uidhashfn:   ((uid >> BITS) + uid) & (SZ - 1)     (all GKI 5.10 .. 6.18)
- *   hash_32:       uid * 0x61c88647 >> (32 - BITS)      (mainline)
- *
- * Reading it back matters: the replacement uid has to land in the same bucket as the
- * hidden uid, otherwise a hidden uid and a uid that simply does not exist walk different
- * hash chains and cost measurably different amounts of time.
+ * Read the uid hash formula out of find_user()'s own code: __uidhashfn
+ * (((uid >> bits) + uid) & (SZ - 1)) or hash_32 (uid * 0x61c88647 >> (32 - bits)).
  */
 #define UID_HASH_BASE 0x40000000u
 #define UID_HASH_GOLDEN 0x61c88647u
@@ -174,8 +186,8 @@ static u32 make_replace(u32 target)
 	u32 want = uid_hash_apply(&g_hash, target);
 	u32 k;
 
-	for (k = 0; k < (1u << 20); k++) {
-		u32 cand = UID_HASH_BASE + k;
+	for (k = 0; k < POLICY_REPL_MAX; k++) {
+		u32 cand = POLICY_REPL_BASE + k;
 		struct user_struct *us;
 
 		if (uid_hash_apply(&g_hash, cand) != want)
@@ -186,113 +198,409 @@ static u32 make_replace(u32 target)
 		free_uid(us);
 	}
 
-	pr_warn("uidfake: no same-bucket replacement for %u\n", target);
-	return 0x7fffffffu;
+	pr_warn("uidfake: no same-bucket replacement for %u among %u candidates\n",
+		target, POLICY_REPL_MAX);
+	return POLICY_REPL_BASE;
+}
+
+struct layout {
+	struct uid_pair *tgt;
+	u64 *masks;
+	struct caller_slot *callers;
+	u32 nlines, shift, nclines, cshift, nmask_words, ntargets, mirror;
+};
+
+/* distinct callers of the policy -> dense hider ids; -1 if there are too many */
+static int build_hiders(struct apply_pair *p, u32 n, u32 *hid)
+{
+	u32 i, j, nh = 0;
+
+	for (i = 0; i < n; i++) {
+		u32 c = p[i].caller;
+
+		if (c == 0)		/* caller==0 hides from everyone, no id needed */
+			continue;
+		for (j = 0; j < nh; j++)
+			if (hid[j] == c)
+				break;
+		if (j < nh)
+			continue;
+		if (nh == POLICY_MAX_CALLERS)
+			return -1;
+		hid[nh++] = c;
+	}
+	return (int)nh;
+}
+
+/* exact caller table: POLICY_CLINE_WAY slots per line, doubling until everyone fits */
+static int layout_callers(struct layout *l, const u32 *hid, u32 nh)
+{
+	u32 nclines;
+
+	for (nclines = 8; nclines <= POLICY_MAX_LINES; nclines <<= 1) {
+		struct caller_slot *cs;
+		u32 i, cshift = 32 - ilog2(nclines);
+
+		cs = kcalloc((size_t)nclines * POLICY_CLINE_WAY, sizeof(*cs), GFP_KERNEL);
+		if (!cs)
+			return -1;
+		for (i = 0; i < nh; i++) {
+			u32 line = policy_caller_line(hid[i], cshift), k, placed = 0;
+
+			for (k = 0; k < POLICY_CLINE_WAY; k++) {
+				struct caller_slot *s = &cs[(size_t)line * POLICY_CLINE_WAY + k];
+
+				if (!s->uid) {
+					s->uid = hid[i];
+					s->id = i;
+					placed = 1;
+					break;
+				}
+			}
+			if (!placed)
+				break;
+		}
+		if (i == nh) {
+			l->callers = cs;
+			l->nclines = nclines;
+			l->cshift = cshift;
+			return 0;
+		}
+		kfree(cs);
+	}
+	return -1;
+}
+
+/* target slots and their masks, on the kernel's own bucket lines when it fits */
+static int layout_targets(struct layout *l, struct apply_pair *p, u32 n,
+			  const u32 *hid, u32 nh)
+{
+	struct uid_pair *tgt;
+	u64 *masks;
+	u32 *cnt;
+	u32 i, j, k, nlines, shift, mirror = 1, nt = 0;
+	size_t last = 0;
+
+	cnt = kcalloc(POLICY_MAX_LINES, sizeof(*cnt), GFP_KERNEL);
+	if (!cnt)
+		return -1;
+	nlines = 1u << (g_hash.bits > 3 ? g_hash.bits - 3 : 0);
+	if (nlines > POLICY_MAX_LINES)
+		nlines = POLICY_MAX_LINES;
+	for (i = 0; i < n; i++) {
+		if (i && p[i - 1].target == p[i].target)
+			continue;
+		if (++cnt[policy_index_mode(p[i].target, 1, 0) & (nlines - 1)] > POLICY_WAY) {
+			mirror = 0;
+			break;
+		}
+	}
+	if (!mirror) {
+		for (nlines = POLICY_MIN_LINES;
+		     nlines < n && nlines < POLICY_MAX_LINES; nlines <<= 1)
+			;
+		pr_warn("uidfake: policy does not fit the uid-hash line layout\n");
+	}
+	kfree(cnt);
+	shift = 32 - ilog2(nlines);
+
+	tgt = kcalloc((size_t)nlines * POLICY_WAY, sizeof(*tgt), GFP_KERNEL);
+	masks = kcalloc((size_t)nlines * POLICY_WAY * l->nmask_words, sizeof(*masks), GFP_KERNEL);
+	if (!tgt || !masks)
+		goto fail;
+
+	for (i = 0; i < n; i++) {
+		u32 t = p[i].target, c = p[i].caller;
+		u64 *m;
+
+		if (i && p[i - 1].target == t) {
+			m = &masks[last * l->nmask_words];
+		} else {
+			u32 unit = policy_index_mode(t, mirror, shift) & (nlines - 1), placed = 0;
+
+			for (k = 0; k < POLICY_WAY; k++) {
+				struct uid_pair *s = &tgt[(size_t)unit * POLICY_WAY + k];
+
+				if (!s->target) {
+					s->target = t;
+					s->repl_k = (make_replace(t) - POLICY_REPL_BASE) &
+						    ((1u << POLICY_REPL_BITS) - 1);
+					last = (size_t)unit * POLICY_WAY + k;
+					placed = 1;
+					nt++;
+					break;
+				}
+			}
+			if (!placed)
+				goto fail;
+			m = &masks[last * l->nmask_words];
+		}
+
+		if (c == 0) {
+			tgt[last].repl_k |= POLICY_WILD_FLAG;
+			continue;
+		}
+		for (j = 0; j < nh; j++)
+			if (hid[j] == c)
+				break;
+		if (j < nh)
+			m[j >> 6] |= 1ULL << (j & 63);
+	}
+
+	l->tgt = tgt;
+	l->masks = masks;
+	l->nlines = nlines;
+	l->shift = shift;
+	l->mirror = mirror;
+	l->ntargets = nt;
+	return 0;
+
+fail:
+	kfree(masks);
+	kfree(tgt);
+	return -1;
 }
 
 void policy_apply(const u32 *pairs, u32 npairs)
 {
 	unsigned long flags;
+	struct layout l = { };
+	struct apply_pair *tmp;
+	u32 *hid;
 	u32 i, n = 0;
+	int nh, ok = 0;
 
-	if (!g_pairs)
-		return;
+	tmp = kcalloc(POLICY_MAX_PAIRS, sizeof(*tmp), GFP_KERNEL);
+	hid = kcalloc(POLICY_MAX_CALLERS, sizeof(*hid), GFP_KERNEL);
+	if (!tmp || !hid)
+		goto out;
 
-	write_lock_irqsave(&policy_lock, flags);
 	for (i = 0; i < npairs && n < POLICY_MAX_PAIRS; i++) {
-		u32 caller = pairs[2 * i];
 		u32 target = pairs[2 * i + 1];
 
-		/* never hide target=0 (root) or system uids */
-		if (target == 0 || target < 10000)
+		if (target < 10000)		/* never hide target 0 or system uids */
 			continue;
-		g_pairs[n].target = target;
-		g_pairs[n].caller = caller;
+		tmp[n].caller = pairs[2 * i];
+		tmp[n].target = target;
 		n++;
 	}
 
-	if (n)
-		sort_pairs(g_pairs, n);
+	write_lock_irqsave(&policy_lock, flags);
 
 	if (n) {
 		struct uid_hash h;
 
-		if (detect_uid_hash(&h)) {
+		if (detect_uid_hash(&h))
 			g_hash = h;
-			pr_info("uidfake: uid hash = %s bits=%u (read from find_user)\n",
-				h.multiply ? "hash_32" : "__uidhashfn", h.bits);
-		} else {
-			pr_warn("uidfake: cannot read uid hash from find_user; keeping %s bits=%u\n",
-				g_hash.multiply ? "hash_32" : "__uidhashfn", g_hash.bits);
-		}
+		pr_info("uidfake: uid hash = %s bits=%u\n",
+			g_hash.multiply ? "hash_32" : "__uidhashfn", g_hash.bits);
 	}
 
-	/* pairs are sorted by target, so repeated targets share one replacement */
-	for (i = 0; i < n; i++) {
-		if (i > 0 && g_pairs[i].target == g_pairs[i - 1].target)
-			g_pairs[i].replace = g_pairs[i - 1].replace;
+	sort_pairs(tmp, n);
+
+	nh = build_hiders(tmp, n, hid);
+	if (nh < 0)
+		pr_err("uidfake: more than %u callers; keeping previous policy\n",
+		       POLICY_MAX_CALLERS);
+	else if (layout_callers(&l, hid, (u32)nh))
+		pr_err("uidfake: cannot lay out %d caller(s); keeping previous policy\n", nh);
+	else {
+		l.nmask_words = nh ? ((u32)nh + 63) / 64 : 1;
+		if (layout_targets(&l, tmp, n, hid, (u32)nh))
+			pr_err("uidfake: cannot lay out %u pair(s); keeping previous policy\n", n);
 		else
-			g_pairs[i].replace = make_replace(g_pairs[i].target);
+			ok = 1;
 	}
 
-	g_npairs = n;
-	g_active = true;
+	if (ok) {
+		struct uid_pair *o_tgt = g_tgt;
+		u64 *o_masks = g_masks;
+		struct caller_slot *o_callers = g_callers;
+
+		g_tgt = l.tgt;
+		g_masks = l.masks;
+		g_callers = l.callers;
+		g_nlines = l.nlines;
+		g_shift = l.shift;
+		g_ncaller_lines = l.nclines;
+		g_cshift = l.cshift;
+		g_nmask_words = l.nmask_words;
+		g_npairs = n;
+		g_ncallers = nh > 0 ? (u32)nh : 0;
+		g_mirror = l.mirror;
+		l.tgt = NULL;
+		l.masks = NULL;
+		l.callers = NULL;
+		if (o_tgt != dummy_tgt)
+			kfree(o_tgt);
+		if (o_masks != dummy_masks)
+			kfree(o_masks);
+		if (o_callers != dummy_callers)
+			kfree(o_callers);
+	}
+
 	write_unlock_irqrestore(&policy_lock, flags);
 
-	pr_info("uidfake: injected %u pair(s), kept %u\n", npairs, n);
+	if (ok) {
+		u32 checked = 0, hits = 0;
+
+		/* answer every configured pair from the table that is now live */
+		for (i = 0; i < n; i++) {
+			if (tmp[i].caller == 0)
+				continue;
+			checked++;
+			if (policy_lookup((uid_t)tmp[i].caller, (uid_t)tmp[i].target))
+				hits++;
+		}
+		if (hits != checked)
+			pr_err("uidfake: self-check FAILED: %u/%u pairs match\n", hits, checked);
+		else
+			pr_info("uidfake: self-check: %u/%u pairs match\n", hits, checked);
+	}
+
+out:
+	kfree(l.masks);
+	kfree(l.tgt);
+	kfree(l.callers);
+	kfree(hid);
+	kfree(tmp);
+	pr_info("uidfake: injected %u pair(s), %u caller(s), %u line(s), %u mask word(s), %s layout\n",
+		npairs, g_ncallers, g_nlines, g_nmask_words, g_mirror ? "uid-hash" : "own-hash");
 }
+
 EXPORT_SYMBOL_GPL(policy_apply);
 
 /*
- * Constant-cost lookup: returns the same-bucket replacement uid (0 = not hidden).
+ * One line, and it is the line the kernel's own uid hash lands on.
  *
- * Hit, miss, target inside the table or beyond it: all of them must execute exactly
- * the same instruction stream and the same number of loads -- fixed 16-step binary
- * search, fixed 32-entry window scan, indices clamped to [0, last] so every iteration
- * loads, and csel (a value select) instead of if/ternary (control flow).
- * Otherwise "is this uid hidden" leaks through the handler's own runtime: an earlier
- * implementation measured hid=7 vs ref=6 ticks because an out-of-table target skipped
- * loads via `ok ? load : const`.
+ * uidhash_table[] stores 8 bucket pointers per 64-byte line and hashes uids with a formula
+ * read back from find_user() at apply time, so the line index `uid_hash(target) >> 3` is
+ * exactly the line the kernel's own bucket lookup touches for that uid: a cache observer
+ * sees the rhythm the kernel produces by itself (continuous app uids cluster on the same
+ * few lines in the kernel too), absolute positions stay unknown to userspace (kernel
+ * KASLR), and which slot of the line a target occupies never changes the cache set because
+ * the whole line is read.
+ *
+ * The caller is matched exactly, not by a hash bit: the lookup compares it against the
+ * table of configured callers and builds a one-hot word, so a caller that is not in the
+ * policy gets a zero (plus the wildcard bit) and can never match a target's mask by
+ * accident. A shared mask bit would hide a target from an app that was never configured to
+ * see it hidden, which is how masking schemes silently break the policy.
+ *
+ * Cost is fixed: POLICY_WAY slot loads from the line plus POLICY_CALLERS comparisons, from
+ * fixed offsets, no loop over data, no data branch, and the table (16 lines = 1 KB at 7
+ * hash bits) stays in L1. A policy that does not fit the pooled layout falls back to our
+ * own hash over a table sized from the target count, blended branch-free.
+ *
+ * What no dynamic policy hook can remove is stated plainly: consulting a policy costs two
+ * cache lines per query -- the target's line and the fixed caller table.
+ */
+/*
+ * Table line index: the top bits of a 64-bit product, so the result is always in
+ * [0, 2^(32 - shift)). The multiplier is 64-bit on purpose -- with a 32-bit one the high
+ * bits stay zero for small uids and every uid would land in the same line.
+ */
+static u32 hash_line(u64 key, u32 shift)
+{
+	key *= 0x9E3779B97F4A7C15ULL;
+	return (u32)(key >> (32 + shift));
+}
+
+/* target table: keyed by the pair, so different callers do not share a line layout */
+static u32 policy_hash(u32 caller, u32 target, u32 shift)
+{
+	return hash_line(((u64)target << 32) | caller, shift);
+}
+
+/* caller table: keyed by the caller alone (its timing may differ between callers) */
+static u32 policy_caller_line(u32 caller, u32 shift)
+{
+	return hash_line(caller, shift);
+}
+
+/* the kernel's uid hash, branch-free for both detected variants */
+static u32 policy_bucket(u32 target, u32 bits, u32 multiply)
+{
+	u32 hfn = ((target >> bits) + target) & ((1u << bits) - 1);
+	u32 h32 = (u32)(((u64)target * UID_HASH_GOLDEN) >> (32 - bits));
+	u32 sel = (u32)0 - multiply;
+
+	return (hfn & ~sel) | (h32 & sel);
+}
+
+/* the line the kernel's bucket lookup touches for this uid */
+static u32 policy_index_mirror(u32 target)
+{
+	return policy_bucket(target, g_hash.bits, (u32)g_hash.multiply) >> 3;
+}
+
+static u32 policy_index_own(u32 target, u32 shift)
+{
+	return policy_hash(0, target, shift);
+}
+
+/* apply-time helper: the line of the mode being laid out, blended branch-free */
+static u32 policy_index_mode(u32 target, u32 mirror, u32 shift)
+{
+	u32 mir = policy_index_mirror(target);
+	u32 own = policy_index_own(target, shift);
+	u32 m = (u32)0 - mirror;
+
+	return (mir & m) | (own & ~m);
+}
+
+/* hider id of a caller, or POLICY_ID_NONE if it hides nothing */
+static u32 caller_id(u32 caller)
+{
+	const struct caller_slot *cs =
+		&g_callers[(size_t)policy_caller_line(caller, g_cshift) * POLICY_CLINE_WAY];
+	u32 k, id = POLICY_ID_NONE;
+
+	for (k = 0; k < POLICY_CLINE_WAY; k++)
+		if (cs[k].uid == caller)
+			id = cs[k].id;
+	return id;
+}
+
+/* the caller's bit in a mask: all words are read, the bit comes from the owning word */
+static u32 mask_bit(const u64 *m, u32 cid)
+{
+	u32 w, bit = 0;
+
+	for (w = 0; w < g_nmask_words; w++)
+		bit |= (u32)((m[w] >> (cid & 63)) & 1) & (u32)(w == (cid >> 6));
+	return bit;
+}
+
+/*
+ * Same lines and same loads for a given (caller, target), whatever the answer: the target's
+ * line and the masks of all its slots are read in full.
  */
 u32 policy_lookup(uid_t caller, uid_t target)
 {
 	unsigned long flags;
-	u32 repl = 0;
 	u32 c = (u32)caller, t = (u32)target;
-	u32 lo, hi, k, n, last;
+	u32 cid, repl = 0, hit = 0, wild = 0, rk = 0, k, unit;
+	const struct uid_pair *sl;
+	const u64 *mk;
 
-	if ((caller % 100000) <= 1000)
-		return 0;
-	if (caller == target)
+	if ((caller % 100000) <= 1000 || caller == target)
 		return 0;
 
 	read_lock_irqsave(&policy_lock, flags);
-	if (g_active && g_npairs) {
-		n = g_npairs;
-		last = n - 1;
-		lo = 0;
-		hi = n;
-		for (k = 0; k < 16; k++) {
-			u32 mid = (lo + hi) >> 1;
-			u32 j = (mid < n) ? mid : last;
-			u32 v = g_pairs[j].target;
-			u32 lt = (v < t);
+	cid = caller_id(c);
+	unit = policy_index_mode(t, g_mirror, g_shift);
+	sl = &g_tgt[(size_t)unit * POLICY_WAY];
+	mk = &g_masks[(size_t)unit * POLICY_WAY * g_nmask_words];
+	for (k = 0; k < POLICY_WAY; k++) {
+		u32 eq = (sl[k].target == t);
+		u32 bit = mask_bit(&mk[(size_t)k * g_nmask_words], cid);
 
-			lo = lt ? (mid + 1) : lo;
-			hi = lt ? hi : mid;
-		}
-		for (k = 0; k < POLICY_SCAN_WIN; k++) {
-			u32 idx = lo + k;
-			u32 ok = (idx < n);
-			u32 j = ok ? idx : last;
-			u32 pt = g_pairs[j].target;
-			u32 pc = g_pairs[j].caller;
-			u32 rp = g_pairs[j].replace;
-			u32 m = ok & (pt == t) & ((pc == 0) | (pc == c));
-
-			repl |= m ? rp : 0;
-		}
+		hit |= eq & bit & (cid != POLICY_ID_NONE);
+		wild |= eq & (sl[k].repl_k >> 15);
+		rk |= eq ? (sl[k].repl_k & ((1u << POLICY_REPL_BITS) - 1)) : 0;
 	}
+	repl = (hit | wild) ? (POLICY_REPL_BASE + rk) : 0;
 	read_unlock_irqrestore(&policy_lock, flags);
 
 	return repl;
@@ -300,20 +608,34 @@ u32 policy_lookup(uid_t caller, uid_t target)
 
 EXPORT_SYMBOL_GPL(policy_lookup);
 
+static void policy_reset(void)
+{
+	g_tgt = dummy_tgt;
+	g_masks = dummy_masks;
+	g_callers = dummy_callers;
+	g_nlines = POLICY_MIN_LINES;
+	g_shift = 32 - ilog2(POLICY_MIN_LINES);
+	g_ncaller_lines = POLICY_MIN_LINES;
+	g_cshift = g_shift;
+	g_nmask_words = 1;
+	g_npairs = 0;
+	g_ncallers = 0;
+	g_mirror = 0;
+}
+
 int policy_init(void)
 {
-	g_pairs = kcalloc(POLICY_MAX_PAIRS, sizeof(*g_pairs), GFP_KERNEL);
-	if (!g_pairs)
-		return -ENOMEM;
-	g_npairs = 0;
-	g_active = false;
+	policy_reset();
 	return 0;
 }
 
 void policy_free(void)
 {
-	kfree(g_pairs);
-	g_pairs = NULL;
-	g_npairs = 0;
-	g_active = false;
+	if (g_tgt != dummy_tgt)
+		kfree(g_tgt);
+	if (g_masks != dummy_masks)
+		kfree(g_masks);
+	if (g_callers != dummy_callers)
+		kfree(g_callers);
+	policy_reset();
 }

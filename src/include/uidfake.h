@@ -7,7 +7,25 @@
 #include <linux/rwlock.h>
 
 #define POLICY_MAX_PAIRS 4096
-#define POLICY_SCAN_WIN  32
+
+/*
+ * Two tables. The target table is read on every query and is indexed like the kernel's own
+ * uidhash (8 bucket pointers per line), with the masks of a whole line read either way; the
+ * caller table is matched by uid and its cost may differ between callers. A target's mask is
+ * a bitmap over dense hider ids, so a target can be hidden from any subset of the policy's
+ * callers and the caller count is limited only by POLICY_MAX_CALLERS.
+ */
+
+#define POLICY_WAY         8         /* target slots per 64-byte line */
+#define POLICY_CLINE_WAY   8         /* caller slots per 64-byte line */
+#define POLICY_MIN_LINES   16
+#define POLICY_MAX_LINES   4096
+#define POLICY_MAX_CALLERS 4096
+#define POLICY_REPL_BITS   12
+#define POLICY_REPL_BASE   0x40000000u
+#define POLICY_REPL_MAX    (1u << POLICY_REPL_BITS)
+#define POLICY_ID_NONE     0xffffffffu
+#define POLICY_WILD_FLAG   (1u << 15)	/* slot flag: "hide from any caller" */
 
 /*
  * The uid hash is not hardcoded here on purpose: policy.c reads the formula the
@@ -16,10 +34,14 @@
 
 extern rwlock_t policy_lock;
 
-struct uid_pair {
+struct uid_pair {	/* 8 bytes: POLICY_WAY of them fill one cache line */
 	u32 target;
-	u32 caller;
-	u32 replace;	/* same-bucket, non-existent uid used for the lookup */
+	u32 repl_k;
+};
+
+struct caller_slot {	/* 8 bytes: POLICY_CLINE_WAY of them fill one cache line */
+	u32 uid;
+	u32 id;
 };
 
 void policy_apply(const u32 *pairs, u32 npairs);
