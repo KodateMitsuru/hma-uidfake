@@ -77,5 +77,12 @@ ko/<kmi>_arm64_hma_uidfake.ko     customize.sh picks one via uname -r
    length differs between a hidden uid and a genuinely absent one.
 3. The policy lookup must do constant work: fixed 16-step binary search, fixed 32-entry
    window, indices clamped so every iteration loads, `cmp`+`csel` for the value select.
-4. Restore the syscall argument before returning. arm64's `kernel_exit` writes x0..x29 back
-   from `pt_regs`, so an unrestored argument shows up in the caller's register.
+4. Never touch the syscall's own `pt_regs`. The probe sits on `find_user()` -- the first
+   place a uid exists as a plain argument register, and the function that
+   `getpriority(PRIO_USER)`, `setpriority(PRIO_USER)`, `ioprio_get` and `ioprio_set` all call
+   for their uid branch (their pid/pgrp branches never reach it, so those stay untouched
+   without a `which` check). Substituting the uid there leaves the syscall's `pt_regs`
+   alone, so `/proc/<tid>/syscall`, ptrace register reads, syscall-exit stops and audit can
+   only ever show the original argument -- and there is nothing to restore, hence no
+   return handler. (arm64 has no in-register syscall entry to hook instead: there is no
+   `__do_sys_`/`__se_sys_` symbol, the body is inlined into the `__arm64_sys_` wrapper.)
