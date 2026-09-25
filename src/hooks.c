@@ -22,7 +22,7 @@
 
 struct kr_state {
   struct pt_regs* uregs;
-  u32 orig_who;
+  u64 orig_who; /* the whole argument register, upper 32 bits included */
   u8 active;
 };
 
@@ -39,27 +39,35 @@ static void hook_rewrite(struct pt_regs* regs, u32 which_val,
 
   if ((u32)uregs->regs[ARG_WHICH] != which_val) return;
 
-  st->orig_who = (u32)uregs->regs[ARG_WHO];
-  who = (s32)st->orig_who;
+  st->orig_who = uregs->regs[ARG_WHO];
+  who = (s32)(u32)st->orig_who;
 
-  if (who > 0) {
+  /*
+   * No "who > 0" / "target != 0" shortcut here: the work must not depend on the
+   * value being queried, otherwise a caller could fingerprint the hook by comparing a
+   * negative (huge) uid against an ordinary one. policy_lookup() is constant cost and
+   * the table only holds app uids, so a huge uid simply never matches.
+   */
+  {
     uid_t caller = __kuid_val(current_fsuid());
-    uid_t target = (uid_t)who;
+    u32 target = (u32)who;
 
-    if (target != 0 && caller != target) repl = policy_lookup(caller, target);
+    if (caller != target) repl = policy_lookup(caller, target);
   }
 
   {
-    u32 orig = st->orig_who;
-    u32 val;
+    u64 orig = st->orig_who;
+    /* replacement in the low 32 bits, the caller's upper bits left untouched */
+    u64 cand = (orig & ~0xffffffffULL) | (u64)repl;
+    u64 val;
 
     /*
-     * use asm to keep the comparison and selection in one instruction to
-     * avoid side-channel attack.
+     * asm keeps the comparison and selection in one instruction to avoid side-channel
+     * attack, and 64-bit csel keeps the untouched upper half of the register intact.
      */
-    asm("cmp\t%w[r], #0\n\tcsel\t%w[v], %w[r], %w[o], ne"
+    asm("cmp\t%w[r], #0\n\tcsel\t%[v], %[c], %[o], ne"
         : [v] "=r"(val)
-        : [r] "r"(repl), [o] "r"(orig)
+        : [r] "r"(repl), [c] "r"(cand), [o] "r"(orig)
         : "cc");
 
     uregs->regs[ARG_WHO] = val;
@@ -78,10 +86,10 @@ static struct pt_regs g_scratch_regs;
  */
 static void hook_restore(struct kr_state* st) {
   struct pt_regs* dst = st->uregs ? st->uregs : &g_scratch_regs;
-  u32 cur = (u32)dst->regs[ARG_WHO];
-  u32 val;
+  u64 cur = dst->regs[ARG_WHO];
+  u64 val;
 
-  asm("cmp\t%w[f], #0\n\tcsel\t%w[v], %w[o], %w[c], ne"
+  asm("cmp\t%w[f], #0\n\tcsel\t%[v], %[o], %[c], ne"
       : [v] "=r"(val)
       : [f] "r"((u32)st->active), [o] "r"(st->orig_who), [c] "r"(cur)
       : "cc");
