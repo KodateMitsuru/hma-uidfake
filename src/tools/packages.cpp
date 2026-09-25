@@ -85,11 +85,19 @@ std::optional<PackageDb> PackageDb::load(const std::filesystem::path &list_path)
         Log::warn("packages.list: {} unparsable line(s)", malformed);
 
     db.system_apps_ = read_system_apps(list_path);
-    if (db.system_apps_.empty())
-        Log::warn("no system packages recognised in {}; excludeSystemApps will do nothing",
-                  list_path.string());
-    else
-        Log::info("{} system app(s) recognised", db.system_apps_.size());
+    /* The count only moves when something is installed or removed, so say it when it does:
+     * the sync path runs after every change and the repeated line was pure noise. */
+    static std::size_t reported = 0;
+    if (db.system_apps_.empty()) {
+        if (reported != 0) {
+            reported = 0;
+            Log::warn("no system packages recognised in {}; excludeSystemApps will do nothing",
+                      list_path.string());
+        }
+    } else if (db.system_apps_.size() != reported) {
+        reported = db.system_apps_.size();
+        Log::info("{} system app(s) recognised", reported);
+    }
     return db;
 }
 
