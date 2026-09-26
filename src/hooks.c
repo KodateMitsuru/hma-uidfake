@@ -143,7 +143,7 @@ static asmlinkage long uid_hook(const struct pt_regs *regs, unsigned which_user,
 	if ((u32)regs->regs[0] != which_user)
 		return orig(regs);
 
-	repl = policy_lookup((u32)__kuid_val(current_fsuid()), (u32)regs->regs[ARG_WHO]);
+	repl = policy_query((u32)regs->regs[ARG_WHO]);
 	copy.regs[ARG_WHO] = repl ? (u64)repl : regs->regs[ARG_WHO];
 	return orig(&copy);
 }

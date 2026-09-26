@@ -961,28 +961,45 @@ static bool uidfake_tag_pending_here(void)
 	return (READ_ONCE(task_thread_info(current)->flags) & UF_TAG_PENDING) != 0;
 }
 
-u32 policy_lookup(uid_t caller, uid_t target)
+/* Cold paths, kept out of line so the query itself stays small enough to inline. */
+static noinline void uidfake_warn_pending(void)
 {
-	u32 app = uidfake_tag_app();
+	static unsigned logged;
+
+	if (logged < 4) {
+		logged++;
+		pr_info("uidfake: isolated uid %u answered with no app (apk not seen)\n",
+			(u32)__kuid_val(current_fsuid()));
+	}
+}
+
+static noinline void uidfake_warn_untagged(void)
+{
 	static bool warned;
 
-	(void)caller;
-	if (app == 0 && uidfake_tag_pending_here()) {
-		static unsigned warned_pending;
-
-		if (warned_pending < 4) {
-			warned_pending++;
-			pr_info("uidfake: isolated uid %u answered with no app (apk not seen)\n",
-				(u32)__kuid_val(current_fsuid()));
-		}
+	if (!warned) {
+		warned = true;
+		pr_info("uidfake: untagged caller uid %u flags %lx comm %s\n",
+			(u32)__kuid_val(current_fsuid()),
+			(unsigned long)task_thread_info(current)->flags, current->comm);
 	}
-	if (app == 0) {
-		if (!warned) {
-			warned = true;
-			pr_info("uidfake: untagged caller uid %u flags %lx comm %s\n",
-				(u32)__kuid_val(current_fsuid()),
-				(unsigned long)task_thread_info(current)->flags, current->comm);
-		}
+}
+
+/*
+ * The query itself: identity from the tag, then the range rules. Inlined into every hooked
+ * wrapper (that is why policy.c is compiled as part of hooks.c), with the two log paths out of
+ * line -- they are taken once per process at most, and keeping them here would push a few hundred
+ * instructions into twelve wrappers.
+ */
+static __always_inline u32 policy_query(uid_t target)
+{
+	const u32 app = uidfake_tag_app();
+
+	if (unlikely(app == 0)) {
+		if (uidfake_tag_pending_here())
+			uidfake_warn_pending();
+		else
+			uidfake_warn_untagged();
 		return 0;
 	}
 	if ((u32)target % 100000u == app - 1u)
@@ -990,6 +1007,11 @@ u32 policy_lookup(uid_t caller, uid_t target)
 	return policy_lookup_core(target, app - 1u);
 }
 
+u32 policy_lookup(uid_t caller, uid_t target)
+{
+	(void)caller;
+	return policy_query(target);
+}
 /*
  * Explicit identity, for the self-check in policy_apply() and for the host test: caller is a uid
  * and the range rules the head path used to apply live here now.

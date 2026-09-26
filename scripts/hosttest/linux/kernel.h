@@ -4,6 +4,20 @@
 #include <stdio.h>
 #define READ_ONCE(x) (x)
 
+/* the host build has no attributes to model */
+#ifndef __always_inline
+#define __always_inline inline
+#endif
+#ifndef unlikely
+#define unlikely(x) (x)
+#endif
+#ifndef likely
+#define likely(x) (x)
+#endif
+#ifndef noinline
+#define noinline
+#endif
+
 /* the host has one thread, so the barriers around a published index are no-ops */
 #define smp_store_release(ptr, value) do { *(ptr) = (value); } while (0)
 #define smp_load_acquire(ptr) (*(ptr))
