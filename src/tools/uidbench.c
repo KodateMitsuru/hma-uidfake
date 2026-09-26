@@ -434,6 +434,7 @@ int uidbench_main(int argc, char **argv) {
     }
     fflush(stdout);
 
+    free_series(v, d_ab, d_h2, d_c1, d_ab2);
     return (fabs(dab.mean) <= 3.0 * dab2.sd || fabs(dab.mean) <= max_ns) ? 0
                                                                          : 1;
   }

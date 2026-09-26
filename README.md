@@ -131,6 +131,26 @@ own code with no rule for it, and an untagged caller that asked anyway.
    a group larger than the tables -- each is logged and the previous policy stays in force, because
    half a policy hides some of the callers and is exactly the state that leaks.
 
+## Trust assumptions
+
+Each of these is assumed rather than defended against, and each one is a place where the module
+touches something that is not its own:
+
+- The netlink family is `GENL_ADMIN_PERM`: only a process with `CAP_NET_ADMIN` (root) can push a
+  policy, and the kernel side has no other input. Both blobs are length-checked before they are
+  parsed, a rejected update leaves the previous policy in force, and nothing is copied back out.
+- HMA's `config.json` is the policy's source of truth and belongs to HMA's uid -- whoever can write
+  it decides who is hidden, which is the point, and why `sync-tool` reads nothing an app can write.
+- The identity tag lives in bits 40..55 of `thread_info.flags`, which nothing else uses on the
+  kernels this builds against. The tag is only ever read-modify-written with those bits masked out,
+  so a kernel that grew a flag there would collide with the tag rather than be corrupted by it.
+- The ten hooked syscalls take at most three arguments, which is what the register object handed to
+  them covers. That is per call site, not checked at load time.
+- Normal runs print no addresses: the two init lines that do are behind the debug key, and the patch
+  failures hash the pointer with `%p`.
+- The timing difference between a hidden and an absent uid is measured rather than assumed away
+  (`src/tools/uidbench.c`), and every diagnostic that could change it sits behind the static key.
+
 ## Protocol
 
 Little endian, same layout as `src/tools/netlink.cpp`.

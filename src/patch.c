@@ -62,7 +62,8 @@ int uidfake_patch_init(void)
 	patch_mm = (struct mm_struct *)uidfake_lookup("init_mm");
 	g_kimage_voffset = (unsigned long *)uidfake_lookup("kimage_voffset");
 	g_memstart_addr = (unsigned long *)uidfake_lookup("memstart_addr");
-	pr_info("uidfake: init_mm=%px kimage_voffset=%px memstart_addr=%px\n",
+	if (UF_DEBUG_ON())
+		pr_info("uidfake: init_mm=%px kimage_voffset=%px memstart_addr=%px\n",
 		patch_mm, (void *)g_kimage_voffset, (void *)g_memstart_addr);
 	return patch_mm ? 0 : -ENOENT;
 }
@@ -195,12 +196,12 @@ static int patch_do(void *arg)
 	void *alias;
 
 	if (!page) {
-		pr_warn("uidfake: no page for %px\n", r->addr);
+		pr_warn("uidfake: no page for %p\n", r->addr);
 		return -EFAULT;
 	}
 	alias = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
 	if (!alias) {
-		pr_warn("uidfake: vmap of %px failed\n", r->addr);
+		pr_warn("uidfake: vmap of %p failed\n", r->addr);
 		return -ENOMEM;
 	}
 	memcpy(alias + off, r->src, r->len);

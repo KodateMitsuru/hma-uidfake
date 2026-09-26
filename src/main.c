@@ -36,7 +36,7 @@ void uidfake_debug_init(bool on)
 		return;
 	static_branch_enable(&uidfake_debug_key);
 	pr_info("uidfake: diagnostics on for 60 s\n");
-	schedule_delayed_work(&uidfake_debug_work, 60 * HZ);
+	schedule_delayed_work(&uidfake_debug_work, 60UL * HZ);
 }
 
 static int __init uidfake_init(void)

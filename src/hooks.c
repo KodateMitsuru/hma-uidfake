@@ -396,7 +396,7 @@ static void unpatch_entries(uidfake_syscall_t *table, struct hook_entry *e,
 		return;
 	for (i = 0; i < n; i++) {
 		if (e[i].orig)
-			uidfake_patch_text(&table[e[i].nr], &e[i].orig,
+			uidfake_patch_text(&table[e[i].nr], (const void *)&e[i].orig,
 					   sizeof(uidfake_syscall_t), true);
 		e[i].orig = NULL;
 	}
@@ -409,9 +409,11 @@ static int patch_tables(void)
 
 	if (!table || uidfake_patch_init())
 		return -ENOENT;
-	pr_info("uidfake: sys_call_table=%px locator check: find_user=%px linked=%px\n",
-		(void *)table, (void *)uidfake_lookup("find_user"),
-		(void *)find_user);
+	/* Real addresses go behind the debug key: dmesg is readable on plenty of devices. */
+	if (UF_DEBUG_ON())
+		pr_info("uidfake: sys_call_table=%px locator check: find_user=%px linked=%px\n",
+			(void *)table, (void *)uidfake_lookup("find_user"),
+			(void *)find_user);
 
 	main_table = (uidfake_syscall_t *)table;
 	n = patch_entries(main_table, g_hook, ARRAY_SIZE(g_hook));
