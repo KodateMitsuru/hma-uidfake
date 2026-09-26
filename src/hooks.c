@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/cred.h>
+#include <linux/file.h>
+#include <linux/fs.h>
 #include <linux/ioprio.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 
 #include <linux/module.h>
@@ -53,6 +56,10 @@ static asmlinkage long uidfake_setresuid(const struct pt_regs *regs);
 static asmlinkage long uidfake_setgid(const struct pt_regs *regs);
 static asmlinkage long uidfake_setregid(const struct pt_regs *regs);
 static asmlinkage long uidfake_setresgid(const struct pt_regs *regs);
+
+/* The one syscall that names an isolated child: the apk its loader opens. */
+static asmlinkage long uidfake_openat(const struct pt_regs *regs);
+
 static asmlinkage long uidfake32_setuid(const struct pt_regs *regs);
 static asmlinkage long uidfake32_setreuid(const struct pt_regs *regs);
 static asmlinkage long uidfake32_setresuid(const struct pt_regs *regs);
@@ -66,7 +73,11 @@ static struct hook_entry g_hook[] = {
     {__NR_setuid, uidfake_setuid, NULL},	   {__NR_setreuid, uidfake_setreuid, NULL},
     {__NR_setresuid, uidfake_setresuid, NULL},	   {__NR_setgid, uidfake_setgid, NULL},
     {__NR_setregid, uidfake_setregid, NULL},	   {__NR_setresgid, uidfake_setresgid, NULL},
+    {__NR_openat, uidfake_openat, NULL},
 };
+
+/* Appended, so the indices the uid wrappers read their orig from stay put. */
+#define HOOK_OPENAT_IDX (ARRAY_SIZE(g_hook) - 1)
 
 /*
  * AArch32 binaries go through compat_sys_call_table with the ARM (EABI) numbers. They are
@@ -84,11 +95,13 @@ static struct hook_entry g_hook[] = {
 #define NR32_SETREGID 71
 #define NR32_SETRESUID 164
 #define NR32_SETRESGID 170
+#define NR32_OPENAT 322
 
 asmlinkage long uidfake32_getpriority(const struct pt_regs *regs);
 asmlinkage long uidfake32_setpriority(const struct pt_regs *regs);
 asmlinkage long uidfake32_ioprio_get(const struct pt_regs *regs);
 asmlinkage long uidfake32_ioprio_set(const struct pt_regs *regs);
+asmlinkage long uidfake32_openat(const struct pt_regs *regs);
 
 static struct hook_entry g_chook[] = {
     {NR32_GETPRIORITY, uidfake32_getpriority, NULL},
@@ -101,7 +114,10 @@ static struct hook_entry g_chook[] = {
     {NR32_SETGID, uidfake32_setgid, NULL},
     {NR32_SETREGID, uidfake32_setregid, NULL},
     {NR32_SETRESGID, uidfake32_setresgid, NULL},
+    {NR32_OPENAT, uidfake32_openat, NULL},
 };
+
+#define CHOOK_OPENAT_IDX (ARRAY_SIZE(g_chook) - 1)
 #endif
 
 /*
@@ -170,6 +186,198 @@ asmlinkage long uidfake32_ioprio_get(const struct pt_regs *regs)
 asmlinkage long uidfake32_ioprio_set(const struct pt_regs *regs)
 {
 	return uid_hook(regs, IOPRIO_WHO_USER, g_chook[3].orig);
+}
+#endif
+
+/* ---- naming an isolated child from the apk it opens ---- */
+
+/*
+ * The child is named by the first apk it opens, and that happens while its app's code is still
+ * being loaded -- before any of that code runs. The attempt is bounded to exactly that window: a
+ * child that is never named (its app has no rules, or the table is stale) must not keep paying for
+ * a lookup on every open, and nothing may stay observable once its own code is running. From then
+ * on it costs one compare, like every other process.
+ */
+#define UF_ISO_SLOTS 32
+/*
+ * The bound is a count of opens, not a deadline: the open that names the child is the one its
+ * resources are built from, and that sits at a fixed stage of the binding (A12 through A16 all
+ * open it in ContextImpl.createAppContext, before the Application even exists). On the device this
+ * was measured at the 18th open, so 64 leaves room for a ROM that reads more properties or loads
+ * more libraries without ever reaching the child's own code. The deadline only sweeps up a window
+ * whose child stopped opening files, so that a task cannot stay armed forever.
+ */
+#define UF_ISO_OPENS 64
+#define UF_ISO_MS 2000
+
+struct uf_iso_slot {
+	s32 tgid;
+	u32 opens;
+	unsigned long exp;
+};
+
+static DEFINE_SPINLOCK(g_iso_lock);
+static struct uf_iso_slot g_iso[UF_ISO_SLOTS];
+
+/* Opened where an isolated identity is created; the windows are few and short. */
+static void uidfake_iso_arm(void)
+{
+	const s32 pid = task_tgid_nr(current); /* the whole process shares one window */
+	unsigned long flags;
+	u32 i, slot = UF_ISO_SLOTS;
+
+	spin_lock_irqsave(&g_iso_lock, flags);
+	for (i = 0; i < UF_ISO_SLOTS; i++) {
+		if (g_iso[i].tgid == pid || g_iso[i].tgid == 0) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot == UF_ISO_SLOTS)
+		slot = 0; /* every slot busy: the oldest window is long expired */
+	g_iso[slot].tgid = pid;
+	g_iso[slot].opens = 0;
+	g_iso[slot].exp = jiffies + msecs_to_jiffies(UF_ISO_MS);
+	spin_unlock_irqrestore(&g_iso_lock, flags);
+}
+
+static void uidfake_iso_done(void)
+{
+	const s32 pid = task_tgid_nr(current); /* the whole process shares one window */
+	unsigned long flags;
+	u32 i;
+
+	spin_lock_irqsave(&g_iso_lock, flags);
+	for (i = 0; i < UF_ISO_SLOTS; i++) {
+		if (g_iso[i].tgid == pid)
+			g_iso[i].tgid = 0;
+	}
+	spin_unlock_irqrestore(&g_iso_lock, flags);
+}
+
+/* True once this task should stop looking: the window closed, or never opened. */
+static bool uidfake_iso_window_over(void)
+{
+	const s32 pid = task_tgid_nr(current); /* the whole process shares one window */
+	unsigned long flags;
+	bool over = true;
+	u32 i;
+
+	spin_lock_irqsave(&g_iso_lock, flags);
+	for (i = 0; i < UF_ISO_SLOTS; i++) {
+		if (g_iso[i].tgid != pid)
+			continue;
+		g_iso[i].opens++;
+		if (g_iso[i].opens > UF_ISO_OPENS || time_after(jiffies, g_iso[i].exp))
+			g_iso[i].tgid = 0;
+		else
+			over = false;
+		break;
+	}
+	spin_unlock_irqrestore(&g_iso_lock, flags);
+	return over;
+}
+
+static bool uidfake_tag_pending(void)
+{
+	return (((task_thread_info(current)->flags >> UF_TAG_SHIFT) & UF_TAG_MASK) &
+		UF_TAG_UNVERIFIED) != 0;
+}
+
+/*
+ * The identity belongs to the process, not to the thread that happened to open the apk: every
+ * thread carries its own thread_info, and a sibling thread is exactly where a later query comes
+ * from. Threads created afterwards inherit the tag from whoever created them.
+ */
+static void uidfake_tag_group(u32 tag)
+{
+	struct task_struct *t;
+
+	rcu_read_lock();
+	for_each_thread(current, t)
+	{
+		const unsigned long flags = READ_ONCE(task_thread_info(t)->flags);
+		const unsigned long next =
+		    (flags & ~(UF_TAG_MASK << UF_TAG_SHIFT)) | ((unsigned long)tag << UF_TAG_SHIFT);
+
+		if (next != flags)
+			WRITE_ONCE(task_thread_info(t)->flags, next);
+	}
+	rcu_read_unlock();
+}
+
+static void uidfake_tag_verify(u32 tag)
+{
+	if (!uidfake_tag_pending())
+		return;
+	uidfake_iso_done();
+	uidfake_tag_group(tag);
+	pr_info("uidfake: iso uid %u belongs to app %u, from the apk it opened\n",
+		(u32)__kuid_val(current_fsuid()), (u32)tag - 1u + UF_APP_MIN);
+}
+
+/*
+ * The window is over and no apk named this one: it is an app without rules and it answers as one.
+ * Saying so once is enough -- this is a normal outcome, not a failure.
+ */
+static void uidfake_tag_close(void)
+{
+	static unsigned logged;
+
+	uidfake_tag_group(0);
+	if (logged < 4) {
+		logged++;
+		pr_info("uidfake: iso uid %u saw no rule, it answers as an app without one\n",
+			(u32)__kuid_val(current_fsuid()));
+	}
+}
+
+static void uidfake_resolve_fd(int fd, const char *what)
+{
+	struct inode *inode;
+	struct file *file;
+	u32 tag;
+
+	(void)what;
+	if (!uidfake_tag_pending())
+		return;
+	if (uidfake_iso_window_over()) {
+		uidfake_tag_close();
+		return;
+	}
+	file = fget(fd);
+	if (!file)
+		return;
+	inode = file_inode(file);
+	tag = uidfake_apk_lookup(inode->i_sb->s_dev, (u64)inode->i_ino);
+	fput(file);
+	if (tag)
+		uidfake_tag_verify(tag);
+}
+
+asmlinkage long uidfake_openat(const struct pt_regs *regs)
+{
+	long ret;
+
+	if (!uidfake_tag_pending())
+		return g_hook[HOOK_OPENAT_IDX].orig(regs);
+	ret = g_hook[HOOK_OPENAT_IDX].orig(regs);
+	if (ret >= 0)
+		uidfake_resolve_fd((int)ret, "openat");
+	return ret;
+}
+
+#ifdef CONFIG_COMPAT
+asmlinkage long uidfake32_openat(const struct pt_regs *regs)
+{
+	long ret;
+
+	if (!uidfake_tag_pending())
+		return g_chook[CHOOK_OPENAT_IDX].orig(regs);
+	ret = g_chook[CHOOK_OPENAT_IDX].orig(regs);
+	if (ret >= 0)
+		uidfake_resolve_fd((int)ret, "openat32");
+	return ret;
 }
 #endif
 
@@ -314,6 +522,8 @@ static asmlinkage long uid_change_hook(const struct pt_regs *regs, uidfake_sysca
 			security_cred_getsecid(current->real_cred, &after_sid);
 			uidfake_tag_adopt(before, after);
 			uidfake_tag_note(before_sid, after_sid, before, after);
+			if ((after % 100000u) >= UF_ISOLATED_START)
+				uidfake_iso_arm();
 		}
 	}
 	return ret;

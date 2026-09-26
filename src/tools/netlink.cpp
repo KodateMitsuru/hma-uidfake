@@ -240,4 +240,55 @@ bool NetlinkClient::send_once(std::span<const Pair> pairs) {
     return exchange(std::span{request.bytes}.first(nlh->nlmsg_len), reply);
 }
 
+bool NetlinkClient::push_apks(std::span<const ApkEntry> entries) {
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (send_apks_once(entries)) return true;
+        family_.reset();
+        socket_.reset();
+    }
+    Log::warn("kernel side unreachable, caller apk table unchanged");
+    return false;
+}
+
+bool NetlinkClient::send_apks_once(std::span<const ApkEntry> entries) {
+    if (!ensure_connected()) return false;
+
+    if (!family_) {
+        const auto resolved = resolve_family();
+        if (!resolved) return false;
+        family_ = *resolved;
+    }
+
+    const std::size_t blob_len = sizeof(std::uint32_t) * (1 + 4 * entries.size());
+    Buffer request{};
+    request.bytes.assign(NLMSG_SPACE(GENL_HDRLEN) + NLA_ALIGN(NLA_HDRLEN + blob_len), std::byte{0});
+
+    auto* nlh = request.nlmsg();
+    nlh->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN + NLA_HDRLEN + static_cast<int>(blob_len));
+    nlh->nlmsg_type = *family_;
+    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    nlh->nlmsg_seq = ++seq_;
+
+    auto* genl = request.genlmsg();
+    genl->cmd = kCmdApk;
+    genl->version = 1;
+
+    auto* attr = reinterpret_cast<nlattr*>(reinterpret_cast<std::byte*>(genl) + GENL_HDRLEN);
+    attr->nla_type = kAttrBlob;
+    attr->nla_len = NLA_HDRLEN + static_cast<int>(blob_len);
+
+    std::span<std::byte> blob(reinterpret_cast<std::byte*>(attr) + NLA_HDRLEN, blob_len);
+    store_u32(blob, 0, static_cast<std::uint32_t>(entries.size()));
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        const std::size_t at = 4 + 16 * i;
+        store_u32(blob, at + 0, entries[i].dev);
+        store_u32(blob, at + 4, static_cast<std::uint32_t>(entries[i].ino & 0xffffffffu));
+        store_u32(blob, at + 8, static_cast<std::uint32_t>(entries[i].ino >> 32));
+        store_u32(blob, at + 12, entries[i].uid);
+    }
+
+    std::vector<std::byte> reply(kReplySize);
+    return exchange(std::span{request.bytes}.first(nlh->nlmsg_len), reply);
+}
+
 }  // namespace uidfake

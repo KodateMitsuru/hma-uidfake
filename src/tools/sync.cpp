@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "sync.hpp"
 
+#include <sys/stat.h>
+
+#include <array>
 #include <cstring>
+#include <set>
 #include <string_view>
+#include <vector>
 
 #include "common.hpp"
 #include "hma.hpp"
@@ -25,6 +30,58 @@ std::filesystem::path resolve_config_path(const std::filesystem::path& path) {
         if (std::filesystem::exists(alternative, ignored)) return alternative;
     }
     return path;
+}
+
+/*
+ * The apk files of one app. The kernel compares their inodes, so what is collected here is
+ * exactly that: nothing but numbers, and only for the apps that have rules.
+ */
+constexpr std::array<std::string_view, 6> kApkRoots = {"/data/app",        "/system/app",
+                                                       "/system/priv-app", "/system_ext/app",
+                                                       "/product/app",     "/vendor/app"};
+constexpr std::size_t kApkLimit = 512; /* the kernel takes 1024 */
+
+bool dir_matches(std::string_view name, std::string_view pkg) {
+    if (name == pkg) return true;
+    return name.size() > pkg.size() && name.compare(0, pkg.size(), pkg) == 0 &&
+           name[pkg.size()] == '-';
+}
+
+void collect_apks(const std::filesystem::path& dir, std::uint32_t uid, std::vector<ApkEntry>& out) {
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator{dir, ec}) {
+        if (ec) return;
+        if (!entry.is_regular_file(ec)) continue;
+        if (entry.path().extension() != ".apk") continue;
+        if (out.size() >= kApkLimit) return;
+        struct stat info{};
+        if (::stat(entry.path().c_str(), &info) != 0) continue;
+        Log::info("apk {} dev {} ino {} uid {}", entry.path().string(),
+                  static_cast<std::uint32_t>(info.st_dev), static_cast<std::uint64_t>(info.st_ino),
+                  uid);
+        out.push_back(ApkEntry{.dev = static_cast<std::uint32_t>(info.st_dev),
+                               .ino = static_cast<std::uint64_t>(info.st_ino),
+                               .uid = uid});
+    }
+}
+
+/* /data/app holds the app dir one level deeper than the system roots do. */
+void find_app_dir(const std::filesystem::path& base, std::string_view pkg, std::uint32_t uid,
+                  std::vector<ApkEntry>& out, int depth) {
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator{base, ec}) {
+        if (ec) return;
+        if (!entry.is_directory(ec)) continue;
+        if (dir_matches(entry.path().filename().string(), pkg)) {
+            collect_apks(entry.path(), uid, out);
+        } else if (depth > 0) {
+            find_app_dir(entry.path(), pkg, uid, out, depth - 1);
+        }
+    }
+}
+
+void collect_app_apks(std::string_view pkg, std::uint32_t uid, std::vector<ApkEntry>& out) {
+    for (const auto root : kApkRoots) find_app_dir(root, pkg, uid, out, 1);
 }
 
 }  // namespace
@@ -75,6 +132,28 @@ void Syncer::sync_now() {
 
     if (!netlink_.push(pairs)) return;
     Log::info("synced {} pair(s)", pairs.size());
+
+    /*
+     * Then the inodes of the apks those callers run out of, so an isolated child can be named
+     * when it opens its own apk. A rule with caller == 0 applies to anyone, so every app is a
+     * possible caller and every apk is registered.
+     */
+    std::set<std::uint32_t> callers;
+    bool wild = false;
+    for (const auto& pair : pairs) {
+        if (pair.caller == 0) {
+            wild = true;
+        } else {
+            callers.insert(pair.caller);
+        }
+    }
+    std::vector<ApkEntry> apks;
+    for (const auto& [name, uid] : packages->by_name()) {
+        if (!wild && !callers.contains(uid)) continue;
+        collect_app_apks(name, uid, apks);
+    }
+    if (!netlink_.push_apks(apks)) return;
+    Log::info("registered {} caller apk inode(s)", apks.size());
 }
 
 bool Syncer::run() {

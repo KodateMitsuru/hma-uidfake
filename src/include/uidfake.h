@@ -54,14 +54,25 @@ u32 policy_lookup_as(uid_t caller, uid_t target);
  * unforgeable: setuid() can no longer pick which hiding rules apply. Only the app id is stored,
  * because the policy is keyed by app id anyway.
  */
-#define UF_SID_MAX 512 /* entries in the sid -> app id table */
 #define UF_TAG_SHIFT 40
 #define UF_TAG_MASK 0xffffUL
 #define UF_APP_MIN POLICY_APP_ID_MIN
 #define UF_APP_SPAN POLICY_APP_ID_SPAN
 #define UF_ISOLATED_START 90000u /* KernelSU: app_zygote children are 90000-98999 too */
 
-u32 uidfake_tag_app(void); /* app id + 1, or 0 when untagged */
+/*
+ * A tag written for an isolated child from the SID it was born with is a guess: on a ROM that
+ * gives every app the same context it names the wrong app. The first file the child maps that
+ * installd marked with the app's own group settles it, and this bit says which of the two a tag
+ * is.
+ */
+#define UF_TAG_UNVERIFIED 0x8000UL
+
+#define UF_APK_MAX 1024 /* caller apk inodes the kernel knows, pushed by the helper */
+
+u32 uidfake_tag_app(void);		       /* app id + 1, or 0 when untagged */
+int uidfake_apk_apply(const u32 *blob, u32 n); /* n * (st_dev, ino_lo, ino_hi, uid) */
+u32 uidfake_apk_lookup(dev_t s_dev, u64 ino);
 void uidfake_tag_adopt(u32 old_uid, u32 new_uid);
 void uidfake_tag_prime(void);
 void uidfake_tag_note(u32 before_sid, u32 after_sid, u32 old_uid, u32 new_uid);

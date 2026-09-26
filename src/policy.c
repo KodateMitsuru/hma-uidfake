@@ -636,54 +636,6 @@ static u32 policy_index_mode(u32 target, u32 mirror, u32 shift)
  * allocate or wait for a grace period. (A first version used RCU with synchronize_rcu() per note;
  * that is fatal when the caller holds rcu_read_lock, and needlessly slow from a hook.)
  */
-struct sid_entry {
-	u32 sid;
-	u32 app_id;
-};
-
-static DEFINE_SPINLOCK(g_sid_lock);
-static struct sid_entry g_sids[UF_SID_MAX];
-static u32 g_sid_count;
-
-static void uidfake_sid_note(u32 sid, u32 app_id)
-{
-	unsigned long flags;
-	u32 i;
-
-	if (sid == 0)
-		return;
-
-	spin_lock_irqsave(&g_sid_lock, flags);
-	for (i = 0; i < g_sid_count; i++) {
-		if (g_sids[i].sid == sid)
-			goto out;
-	}
-	if (g_sid_count < UF_SID_MAX) {
-		g_sids[g_sid_count].sid = sid;
-		g_sids[g_sid_count].app_id = app_id;
-		g_sid_count++;
-		pr_info("uidfake: sid %u -> app %u (map %u)\n", sid, app_id, g_sid_count);
-	}
-out:
-	spin_unlock_irqrestore(&g_sid_lock, flags);
-}
-
-static u32 uidfake_sid_lookup(u32 sid)
-{
-	unsigned long flags;
-	u32 i, app = 0;
-
-	spin_lock_irqsave(&g_sid_lock, flags);
-	for (i = 0; i < g_sid_count; i++) {
-		if (g_sids[i].sid == sid) {
-			app = g_sids[i].app_id + 1u;
-			break;
-		}
-	}
-	spin_unlock_irqrestore(&g_sid_lock, flags);
-	return app;
-}
-
 /*
  * Called from the id-setter hooks once a change succeeded. before_sid is the SID the task had
  * before the syscall, after_sid the one it has now.
@@ -747,50 +699,25 @@ void uidfake_tag_prime(void)
 
 void uidfake_tag_note(u32 before_sid, u32 after_sid, u32 old_uid, u32 new_uid)
 {
+	(void)before_sid;
+	(void)after_sid;
+
 	if ((new_uid % 100000u) >= UF_ISOLATED_START) {
-		/* An isolated child: its SID at this moment is still the app's. */
-		const u32 app = uidfake_sid_lookup(before_sid);
-		{
-			struct task_struct *pp = current->real_parent;
-			struct task_struct *gp = pp ? pp->real_parent : NULL;
-			u32 psid = 0, gsid = 0;
+		/*
+		 * An isolated child. Nothing in its own state names the app it belongs to: the
+		 * context is shared, the supplementary groups are the pool's and its parent is
+		 * the zygote. It is marked here so the first file it opens can name it; until one
+		 * does it answers as a process with no rules of its own.
+		 */
+		const unsigned long flags = READ_ONCE(task_thread_info(current)->flags);
+		const unsigned long cur = (flags >> UF_TAG_SHIFT) & UF_TAG_MASK;
 
-			if (pp)
-				security_cred_getsecid(pp->real_cred, &psid);
-			if (gp)
-				security_cred_getsecid(gp->real_cred, &gsid);
-			pr_info("uidfake: iso birth: parent %s uid %u sid %u, grandparent %s uid %u sid %u\n",
-				pp ? pp->comm : "?", pp ? (u32)__kuid_val(pp->real_cred->fsuid) : 0,
-				psid, gp ? gp->comm : "?",
-				gp ? (u32)__kuid_val(gp->real_cred->fsuid) : 0, gsid);
-		}
-
-		if (app == 0) {
-			/*
-			 * The ROM switched the context before the uid, or the parent's SID was
-			 * never seen: the transition carried no app information, and the kernel has
-			 * no other link to it. Say so rather than guessing, so a ROM that orders
-			 * the two steps the other way is visible instead of silently unprotected.
-			 */
-			pr_info("uidfake: isolated uid %u arrived with sid %u, which is no app of "
-				"ours\n",
-				new_uid, before_sid);
-		}
-		if (app != 0) {
-			/*
-			 * The whole resolution happens here, once: the app is known from the SID
-			 * the child still carries, and the tag it leaves with is the only thing the
-			 * lookup ever reads. Nothing is remembered about the uid, so a uid that a
-			 * later process reuses carries no stale answer.
-			 */
-			const unsigned long flags = READ_ONCE(task_thread_info(current)->flags);
-			const bool untagged = !((flags >> UF_TAG_SHIFT) & UF_TAG_MASK);
-
-			if (untagged)
-				WRITE_ONCE(task_thread_info(current)->flags,
-					   flags | ((unsigned long)app << UF_TAG_SHIFT));
-			pr_info("uidfake: iso birth uid %u sid %u -> app %u, tag %s\n", new_uid,
-				before_sid, app, untagged ? "written" : "already set");
+		if (!cur || (cur & UF_TAG_UNVERIFIED)) {
+			WRITE_ONCE(task_thread_info(current)->flags,
+				   (flags & ~(UF_TAG_MASK << UF_TAG_SHIFT)) |
+				       (UF_TAG_UNVERIFIED << UF_TAG_SHIFT));
+			pr_info("uidfake: iso birth uid %u marked, awaiting the apk it opens\n",
+				new_uid);
 		}
 		return;
 	}
@@ -798,18 +725,8 @@ void uidfake_tag_note(u32 before_sid, u32 after_sid, u32 old_uid, u32 new_uid)
 	if (old_uid < UF_APP_MIN && new_uid >= UF_APP_MIN && new_uid < UF_ISOLATED_START) {
 		const u32 app = (new_uid % 100000u) - UF_APP_MIN;
 
-		if (app < UF_APP_SPAN) {
-			uidfake_sid_note(after_sid, app);
-			pr_info("uidfake: app birth uid %u sid %u -> app %u\n", new_uid, after_sid, app);
-		}
-		return;
-	}
-
-	if (old_uid >= UF_APP_MIN) {
-		const u32 app = uidfake_sid_lookup(before_sid);
-
-		if (app != 0)
-			uidfake_sid_note(after_sid, app - 1u);
+		if (app < UF_APP_SPAN)
+			pr_info("uidfake: app birth uid %u -> app %u\n", new_uid, app);
 	}
 }
 
@@ -820,7 +737,9 @@ void uidfake_tag_note(u32 before_sid, u32 after_sid, u32 old_uid, u32 new_uid)
 
 u32 uidfake_tag_app(void)
 {
-	return (u32)((task_thread_info(current)->flags >> UF_TAG_SHIFT) & UF_TAG_MASK);
+	/* The verification bit is bookkeeping, not part of the identity. */
+	return (u32)((task_thread_info(current)->flags >> UF_TAG_SHIFT) & UF_TAG_MASK) &
+	       ~(u32)UF_TAG_UNVERIFIED;
 }
 
 void uidfake_tag_adopt(u32 old_uid, u32 new_uid)
@@ -932,20 +851,126 @@ static __always_inline u32 policy_lookup_core(uid_t target, u32 app)
  * an untagged process is one that already existed when the module was loaded, and it gets no rules
  * at all rather than an identity derived from a uid that anything could have changed.
  */
+/*
+ * The apk inodes of the apps that have rules. The helper reads package names and pushes the
+ * inode of each of their apks; the kernel only ever compares numbers. The table is consulted
+ * only while an isolated child is still being named -- which is on the open path -- so the lookup
+ * is hashed: a handful of probes whatever the table holds.
+ */
+struct uf_apk { /* 16 bytes */
+	u32 dev;
+	u32 ino_lo;
+	u32 ino_hi;
+	u32 tag; /* 0 marks an empty slot */
+};
+
+#define UF_APK_SLOTS 2048u /* power of two */
+#define UF_APK_PROBE 8u
+
+static DEFINE_SPINLOCK(g_apk_lock);
+static struct uf_apk g_apks[UF_APK_SLOTS];
+static u16 g_apk_used[UF_APK_MAX]; /* slots to clear on the next apply */
+static u32 g_apk_used_n;
+
+static u32 uf_apk_bucket(u32 dev, u32 lo, u32 hi)
+{
+	u32 h = dev * 2654435761u;
+
+	h ^= lo * 2246822519u;
+	h ^= hi * 3266489917u;
+	return h & (UF_APK_SLOTS - 1u);
+}
+
+int uidfake_apk_apply(const u32 *blob, u32 n)
+{
+	unsigned long flags;
+	u32 i, kept = 0, inserted = 0;
+
+	if (n > UF_APK_MAX)
+		return -EINVAL;
+	spin_lock_irqsave(&g_apk_lock, flags);
+	for (i = 0; i < g_apk_used_n; i++)
+		g_apks[g_apk_used[i]].tag = 0;
+	g_apk_used_n = 0;
+	for (i = 0; i < n; i++) {
+		/* 16 bytes per entry, in this order: st_dev, ino_lo, ino_hi, uid. */
+		const u32 *e = &blob[i * 4u];
+		const u32 app = e[3] % 100000u;
+		u32 slot, probe;
+
+		if (app < UF_APP_MIN || app >= UF_APP_MIN + UF_APP_SPAN)
+			continue;
+		kept++;
+		slot = uf_apk_bucket(e[0], e[1], e[2]);
+		for (probe = 0; probe < UF_APK_PROBE; probe++) {
+			const u32 at = (slot + probe) & (UF_APK_SLOTS - 1u);
+			struct uf_apk *dst = &g_apks[at];
+
+			if (dst->tag)
+				continue;
+			dst->dev = e[0];
+			dst->ino_lo = e[1];
+			dst->ino_hi = e[2];
+			dst->tag = app - UF_APP_MIN + 1u;
+			g_apk_used[inserted++] = (u16)at;
+			break;
+		}
+	}
+	g_apk_used_n = inserted;
+	spin_unlock_irqrestore(&g_apk_lock, flags);
+	pr_info("uidfake: %u of %u caller apk inode(s) known\n", inserted, kept);
+	return 0;
+}
+
+u32 uidfake_apk_lookup(dev_t s_dev, u64 ino)
+{
+	/*
+	 * cp_new_stat() reports st_dev with new_encode_dev(), so the number the helper read back is
+	 * that encoding of s_dev. Do the same here instead of decoding on either side.
+	 */
+	const u32 major = (u32)(s_dev >> 20) & 0xfffu;
+	const u32 minor = (u32)s_dev & 0xfffffu;
+	const u32 dev = (minor & 0xffu) | (major << 8) | ((minor & ~0xffu) << 12);
+	const u32 lo = (u32)ino, hi = (u32)(ino >> 32);
+	unsigned long flags;
+	u32 slot, probe, tag = 0;
+
+	spin_lock_irqsave(&g_apk_lock, flags);
+	slot = uf_apk_bucket(dev, lo, hi);
+	for (probe = 0; probe < UF_APK_PROBE; probe++) {
+		const struct uf_apk *e = &g_apks[(slot + probe) & (UF_APK_SLOTS - 1u)];
+
+		if (!e->tag)
+			break;
+		if (e->dev == dev && e->ino_lo == lo && e->ino_hi == hi) {
+			tag = e->tag;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&g_apk_lock, flags);
+	return tag;
+}
+
+/* true while an isolated child is still waiting for the apk that names it */
+static bool uidfake_tag_pending_here(void)
+{
+	return (((task_thread_info(current)->flags >> UF_TAG_SHIFT) & UF_TAG_MASK) &
+		UF_TAG_UNVERIFIED) != 0;
+}
+
 u32 policy_lookup(uid_t caller, uid_t target)
 {
 	u32 app = uidfake_tag_app();
 	static bool warned;
 
 	(void)caller;
-	{
-		/* Probe: is comm the app's name by the time an isolated process asks? */
-		const u32 uid = (u32)__kuid_val(current_fsuid());
-		static u32 seen_uid;
+	if (app == 0 && uidfake_tag_pending_here()) {
+		static unsigned warned_pending;
 
-		if ((uid % 100000u) >= UF_ISOLATED_START && uid != seen_uid) {
-			seen_uid = uid;
-			pr_info("uidfake: iso uid %u comm %s resolved %u\n", uid, current->comm, app);
+		if (warned_pending < 4) {
+			warned_pending++;
+			pr_info("uidfake: isolated uid %u answered with no app (apk not seen)\n",
+				(u32)__kuid_val(current_fsuid()));
 		}
 	}
 	if (app == 0) {
