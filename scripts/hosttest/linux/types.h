@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/types.h> /* the host dev_t and friends, only for these host tests */
 typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
