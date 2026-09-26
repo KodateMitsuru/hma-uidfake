@@ -9,15 +9,12 @@ on:
 
 jobs:
   # One job per KMI, built inside the matching DDK container.
-  # android12-5.10 is listed so it can be attempted, but its kernel tree is not
-  # clang-buildable here; failing that single job does not block packaging.
   lkm:
     name: hma_uidfake.ko (${{ matrix.kmi }})
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/ylarod/ddk:${{ matrix.kmi }}-20260828
       options: --privileged
-    continue-on-error: ${{ matrix.kmi == 'android12-5.10' }}
     strategy:
       fail-fast: false
       matrix:
@@ -44,7 +41,9 @@ jobs:
           mkdir -p "$stage" out
           for f in src/*; do ln -sfn "$PWD/$f" "$stage/$(basename "$f")"; done
 
-          make -C "$KDIR" ARCH=arm64 LLVM=1 M="$stage" modules
+          # CROSS_COMPILE is what a tree this old takes its target triple from; without it clang
+          # emits bitcode for the host and the LTO link says "incompatible with aarch64elf".
+          make -C "$KDIR" ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- M="$stage" modules
           llvm-strip -d "$stage/hma_uidfake.ko" || true
           cp "$stage/hma_uidfake.ko" "out/${{ matrix.kmi }}_arm64_hma_uidfake.ko"
       - uses: actions/upload-artifact@v4
