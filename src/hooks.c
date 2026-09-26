@@ -15,6 +15,8 @@
 #include <linux/uidgid.h>
 #include <linux/user.h>
 
+#include <trace/hooks/syscall_check.h>
+
 #include "uidfake.h"
 
 /* one translation unit with the policy: policy_lookup() is on the hot path and the compiler
@@ -58,8 +60,8 @@ static asmlinkage long uidfake_setgid(const struct pt_regs *regs);
 static asmlinkage long uidfake_setregid(const struct pt_regs *regs);
 static asmlinkage long uidfake_setresgid(const struct pt_regs *regs);
 
-/* The one syscall that names an isolated child: the apk its loader opens. */
-static asmlinkage long uidfake_openat(const struct pt_regs *regs);
+/* Names an isolated child when it opens its app's apk; registered as a vendor hook. */
+static void uidfake_file_open(void *data, const struct file *file);
 
 static asmlinkage long uidfake32_setuid(const struct pt_regs *regs);
 static asmlinkage long uidfake32_setreuid(const struct pt_regs *regs);
@@ -74,11 +76,7 @@ static struct hook_entry g_hook[] = {
     {__NR_setuid, uidfake_setuid, NULL},	   {__NR_setreuid, uidfake_setreuid, NULL},
     {__NR_setresuid, uidfake_setresuid, NULL},	   {__NR_setgid, uidfake_setgid, NULL},
     {__NR_setregid, uidfake_setregid, NULL},	   {__NR_setresgid, uidfake_setresgid, NULL},
-    {__NR_openat, uidfake_openat, NULL},
 };
-
-/* Appended, so the indices the uid wrappers read their orig from stay put. */
-#define HOOK_OPENAT_IDX (ARRAY_SIZE(g_hook) - 1)
 
 /*
  * AArch32 binaries go through compat_sys_call_table with the ARM (EABI) numbers. They are
@@ -102,7 +100,6 @@ asmlinkage long uidfake32_getpriority(const struct pt_regs *regs);
 asmlinkage long uidfake32_setpriority(const struct pt_regs *regs);
 asmlinkage long uidfake32_ioprio_get(const struct pt_regs *regs);
 asmlinkage long uidfake32_ioprio_set(const struct pt_regs *regs);
-asmlinkage long uidfake32_openat(const struct pt_regs *regs);
 
 static struct hook_entry g_chook[] = {
     {NR32_GETPRIORITY, uidfake32_getpriority, NULL},
@@ -115,10 +112,8 @@ static struct hook_entry g_chook[] = {
     {NR32_SETGID, uidfake32_setgid, NULL},
     {NR32_SETREGID, uidfake32_setregid, NULL},
     {NR32_SETRESGID, uidfake32_setresgid, NULL},
-    {NR32_OPENAT, uidfake32_openat, NULL},
 };
 
-#define CHOOK_OPENAT_IDX (ARRAY_SIZE(g_chook) - 1)
 #endif
 
 /*
@@ -330,64 +325,32 @@ static void uidfake_tag_close(void)
 	}
 }
 
-static void uidfake_resolve_fd(int fd, const char *what)
+/*
+ * Called from do_dentry_open() for every file a task opens -- openat, openat2, creat, all of
+ * them -- with the struct file already filled in. It is the vendor hook AOSP keeps for exactly
+ * this (include/trace/hooks/syscall_check.h: "a mechanism for vendor modules to hook and extend
+ * functionality"), so the module no longer needs an entry in sys_call_table to see opens.
+ *
+ * The first thing checked is one bit of the task's flags, so a process that is not waiting for a
+ * name pays an AND here and nothing else.
+ */
+static void uidfake_file_open(void *data, const struct file *file)
 {
-	struct inode *inode;
-	struct file *file;
-	struct fd f;
+	const struct inode *inode;
 	u32 tag;
 
-	(void)what;
+	(void)data;
 	if (!uidfake_tag_pending())
 		return;
 	if (uidfake_iso_window_over()) {
 		uidfake_tag_close();
 		return;
 	}
-	/*
-	 * fdget keeps the file alive without the atomic a counted lookup would cost. 6.12 made the
-	 * member private behind fd_file(), so the access is spelled per version.
-	 */
-	f = fdget(fd);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-	file = fd_file(f);
-#else
-	file = f.file;
-#endif
-	if (!file)
-		return;
 	inode = file_inode(file);
 	tag = uidfake_apk_lookup(inode->i_sb->s_dev, (u64)inode->i_ino);
-	fdput(f);
 	if (tag)
 		uidfake_tag_verify(tag);
 }
-
-asmlinkage long uidfake_openat(const struct pt_regs *regs)
-{
-	long ret;
-
-	if (!uidfake_tag_pending())
-		return g_hook[HOOK_OPENAT_IDX].orig(regs);
-	ret = g_hook[HOOK_OPENAT_IDX].orig(regs);
-	if (ret >= 0)
-		uidfake_resolve_fd((int)ret, "openat");
-	return ret;
-}
-
-#ifdef CONFIG_COMPAT
-asmlinkage long uidfake32_openat(const struct pt_regs *regs)
-{
-	long ret;
-
-	if (!uidfake_tag_pending())
-		return g_chook[CHOOK_OPENAT_IDX].orig(regs);
-	ret = g_chook[CHOOK_OPENAT_IDX].orig(regs);
-	if (ret >= 0)
-		uidfake_resolve_fd((int)ret, "openat32");
-	return ret;
-}
-#endif
 
 /* ---- table patching ---- */
 
@@ -470,6 +433,11 @@ int hooks_install(void)
 {
 	/* the sys_call_table patch is the only hook now: no kprobe fallback */
 	if (!patch_tables()) {
+		/*
+		 * The vendor hook covers every open path, not just openat, and keeps
+		 * sys_call_table down to the uid syscalls.
+		 */
+		register_trace_android_vh_check_file_open(uidfake_file_open, NULL);
 		uidfake_tag_prime(); /* give the processes that already run their tag */
 		return 1;
 	}
@@ -484,6 +452,7 @@ void hooks_remove(void)
 	if (!main_table)
 		return;
 
+	unregister_trace_android_vh_check_file_open(uidfake_file_open, NULL);
 	unpatch_entries(main_table, g_hook, ARRAY_SIZE(g_hook));
 #ifdef CONFIG_COMPAT
 	unpatch_entries(compat_table, g_chook, ARRAY_SIZE(g_chook));
