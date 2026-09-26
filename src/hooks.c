@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/cred.h>
+#include <linux/dcache.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/ioprio.h>
-#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/version.h>
 
@@ -19,7 +19,10 @@
 
 #include "uidfake.h"
 
-/* one translation unit with the policy: policy_lookup() is on the hot path and the compiler
+/* The window is closed from the query path too (see uidfake_close_pending). */
+void uidfake_tag_close(void);
+
+/* one translation unit with the policy: its query is on the hot path and the compiler
  * can then inline it into the syscall wrappers instead of paying a call for every query */
 #include "policy.c"
 
@@ -126,21 +129,33 @@ static struct hook_entry g_chook[] = {
  * register value differs. The task's own pt_regs is never modified, so /proc/<tid>/syscall,
  * ptrace and the syscall-exit stop keep seeing the original argument.
  */
+/*
+ * The ten syscalls hooked here take three arguments at most, and the generated __arm64_sys_*
+ * wrappers read exactly those argument registers -- so the substituted call is handed a three
+ * register object instead of a whole pt_regs. The full struct made the compiler zero 312 bytes on
+ * every hooked call (a memset call, not three stores), and it pushed the frame over the size that
+ * turns the stack canary on. The copy stays unconditional, so a hidden uid and a uid that does not
+ * exist still execute the same instruction stream.
+ */
+struct uidfake_args {
+	u64 regs[3];
+};
+
 static asmlinkage long uid_hook(const struct pt_regs *regs, unsigned which_user,
 				uidfake_syscall_t orig)
 {
-	struct pt_regs copy;
+	struct uidfake_args args;
 	u32 repl;
 
-	copy.regs[0] = regs->regs[0];
-	copy.regs[1] = regs->regs[1];
-	copy.regs[2] = regs->regs[2];
+	args.regs[0] = regs->regs[0];
+	args.regs[1] = regs->regs[1];
+	args.regs[2] = regs->regs[2];
 	if ((u32)regs->regs[0] != which_user)
 		return orig(regs);
 
 	repl = policy_query((u32)regs->regs[ARG_WHO]);
-	copy.regs[ARG_WHO] = repl ? (u64)repl : regs->regs[ARG_WHO];
-	return orig(&copy);
+	args.regs[ARG_WHO] = repl ? (u64)repl : regs->regs[ARG_WHO];
+	return orig((const struct pt_regs *)&args);
 }
 
 asmlinkage long uidfake_getpriority(const struct pt_regs *regs)
@@ -187,90 +202,6 @@ asmlinkage long uidfake32_ioprio_set(const struct pt_regs *regs)
 
 /* ---- naming an isolated child from the apk it opens ---- */
 
-/*
- * The child is named by the first apk it opens, and that happens while its app's code is still
- * being loaded -- before any of that code runs. The attempt is bounded to exactly that window: a
- * child that is never named (its app has no rules, or the table is stale) must not keep paying for
- * a lookup on every open, and nothing may stay observable once its own code is running. From then
- * on it costs one compare, like every other process.
- */
-#define UF_ISO_SLOTS 32
-/*
- * The bound is a count of opens, not a deadline: the open that names the child is the one its
- * resources are built from, and that sits at a fixed stage of the binding (A12 through A16 all
- * open it in ContextImpl.createAppContext, before the Application even exists). On the device this
- * was measured at the 18th open, so 64 leaves room for a ROM that reads more properties or loads
- * more libraries without ever reaching the child's own code. The deadline only sweeps up a window
- * whose child stopped opening files, so that a task cannot stay armed forever.
- */
-#define UF_ISO_OPENS 64
-#define UF_ISO_MS 2000
-
-struct uf_iso_slot {
-	s32 tgid;
-	u32 opens;
-	unsigned long exp;
-};
-
-static DEFINE_SPINLOCK(g_iso_lock);
-static struct uf_iso_slot g_iso[UF_ISO_SLOTS];
-
-/* Opened where an isolated identity is created; the windows are few and short. */
-static void uidfake_iso_arm(void)
-{
-	const s32 pid = task_tgid_nr(current); /* the whole process shares one window */
-	u32 i, slot = UF_ISO_SLOTS;
-
-	spin_lock(&g_iso_lock);
-	for (i = 0; i < UF_ISO_SLOTS; i++) {
-		if (g_iso[i].tgid == pid || g_iso[i].tgid == 0) {
-			slot = i;
-			break;
-		}
-	}
-	if (slot == UF_ISO_SLOTS)
-		slot = 0; /* every slot busy: the oldest window is long expired */
-	g_iso[slot].tgid = pid;
-	g_iso[slot].opens = 0;
-	g_iso[slot].exp = jiffies + msecs_to_jiffies(UF_ISO_MS);
-	spin_unlock(&g_iso_lock);
-}
-
-static void uidfake_iso_done(void)
-{
-	const s32 pid = task_tgid_nr(current); /* the whole process shares one window */
-	u32 i;
-
-	spin_lock(&g_iso_lock);
-	for (i = 0; i < UF_ISO_SLOTS; i++) {
-		if (g_iso[i].tgid == pid)
-			g_iso[i].tgid = 0;
-	}
-	spin_unlock(&g_iso_lock);
-}
-
-/* True once this task should stop looking: the window closed, or never opened. */
-static bool uidfake_iso_window_over(void)
-{
-	const s32 pid = task_tgid_nr(current); /* the whole process shares one window */
-	bool over = true;
-	u32 i;
-
-	spin_lock(&g_iso_lock);
-	for (i = 0; i < UF_ISO_SLOTS; i++) {
-		if (g_iso[i].tgid != pid)
-			continue;
-		g_iso[i].opens++;
-		if (g_iso[i].opens > UF_ISO_OPENS || time_after(jiffies, g_iso[i].exp))
-			g_iso[i].tgid = 0;
-		else
-			over = false;
-		break;
-	}
-	spin_unlock(&g_iso_lock);
-	return over;
-}
-
 static bool uidfake_tag_pending(void)
 {
 	return (READ_ONCE(task_thread_info(current)->flags) & UF_TAG_PENDING) != 0;
@@ -281,7 +212,7 @@ static bool uidfake_tag_pending(void)
  * thread carries its own thread_info, and a sibling thread is exactly where a later query comes
  * from. Threads created afterwards inherit the tag from whoever created them.
  */
-static void uidfake_tag_group(u32 tag)
+static noinline void uidfake_tag_group(u32 tag)
 {
 	struct task_struct *t;
 
@@ -299,11 +230,10 @@ static void uidfake_tag_group(u32 tag)
 	rcu_read_unlock();
 }
 
-static void uidfake_tag_verify(u32 tag)
+static noinline void uidfake_tag_verify(u32 tag)
 {
 	if (!uidfake_tag_pending())
 		return;
-	uidfake_iso_done();
 	uidfake_tag_group(tag);
 	pr_info("uidfake: iso uid %u belongs to app %u, from the apk it opened\n",
 		(u32)__kuid_val(current_fsuid()), (u32)tag - 1u + UF_APP_MIN);
@@ -313,14 +243,14 @@ static void uidfake_tag_verify(u32 tag)
  * The window is over and no apk named this one: it is an app without rules and it answers as one.
  * Saying so once is enough -- this is a normal outcome, not a failure.
  */
-static void uidfake_tag_close(void)
+noinline void uidfake_tag_close(void)
 {
 	static unsigned logged;
 
 	uidfake_tag_group(0);
-	if (logged < 4) {
+	if (logged < 4 && UF_DEBUG_ON()) {
 		logged++;
-		pr_info("uidfake: iso uid %u saw no rule, it answers as an app without one\n",
+		pr_info("uidfake: iso uid %u reached its own code, no rule names it\n",
 			(u32)__kuid_val(current_fsuid()));
 	}
 }
@@ -334,22 +264,73 @@ static void uidfake_tag_close(void)
  * The first thing checked is one bit of the task's flags, so a process that is not waiting for a
  * name pays an AND here and nothing else.
  */
+/*
+ * The app's code directory is what the helper registers, so an open of anything inside it -- the
+ * apk, a vdex, an odex, a library -- names the app as soon as the directory is reached. The walk is
+ * one or two levels (the same for every artifact) and only runs while a child is still unnamed.
+ * Nothing that may or may not exist has to be listed, and the first file of the app's own code that
+ * is opened ends the wait either way: a hit names the app, no hit means it has no rules.
+ */
+#define UF_DIR_DEPTH 4
+
+/*
+ * The app's code directory is what the helper registers, so an open of anything inside it -- the
+ * apk, a vdex, an odex, a library -- names the app as soon as the directory is reached. The walk is
+ * one or two levels (the same for every artifact) and only runs while a child is still unnamed.
+ */
+#define UF_DIR_DEPTH 4
+
+static noinline void uidfake_close_unheard(const struct file *file, u32 dev, int depth)
+{
+	static unsigned logged;
+
+	if (logged >= 6)
+		return;
+	logged++;
+	pr_info("uidfake: no rule: %s in %s/%s (ino %lu dev %u) depth %d\n", current->comm,
+		file->f_path.dentry->d_parent->d_name.name, file->f_path.dentry->d_name.name,
+		(unsigned long)file_inode(file)->i_ino, dev, depth);
+}
+
 static void uidfake_file_open(void *data, const struct file *file)
 {
-	const struct inode *inode;
-	u32 tag;
+	const struct inode *inode = file_inode(file);
+	const struct dentry *dentry;
+	u32 tag = 0;
+	int depth = 0;
 
 	(void)data;
 	if (!uidfake_tag_pending())
 		return;
-	if (uidfake_iso_window_over()) {
-		uidfake_tag_close();
+
+	/*
+	 * Only an open that lands on the filesystem an app's code lives on says anything at all:
+	 * while the framework sets the process up it reads properties, /proc, /dev and /system, and
+	 * those are none of our business. Without this gate the very first property read would end
+	 * the wait.
+	 */
+	if (!uidfake_dev_is_code(inode->i_sb->s_dev))
 		return;
+
+	for (dentry = file->f_path.dentry; dentry && depth < UF_DIR_DEPTH; depth++) {
+		const struct inode *ancestor = d_inode(dentry);
+
+		if (!ancestor)
+			continue;
+		tag = uidfake_apk_lookup(ancestor->i_sb->s_dev, (u64)ancestor->i_ino);
+		if (tag)
+			break;
+		if (dentry == dentry->d_parent)
+			break;
+		dentry = dentry->d_parent;
 	}
-	inode = file_inode(file);
-	tag = uidfake_apk_lookup(inode->i_sb->s_dev, (u64)inode->i_ino);
-	if (tag)
+	if (tag) {
 		uidfake_tag_verify(tag);
+	} else {
+		if (UF_DEBUG_ON())
+			uidfake_close_unheard(file, (u32)inode->i_sb->s_dev, depth);
+		uidfake_tag_close();
+	}
 }
 
 /* ---- table patching ---- */
@@ -499,8 +480,6 @@ static asmlinkage long uid_change_hook(const struct pt_regs *regs, uidfake_sysca
 			security_cred_getsecid(current->real_cred, &after_sid);
 			uidfake_tag_adopt(before, after);
 			uidfake_tag_note(before_sid, after_sid, before, after);
-			if ((after % 100000u) >= UF_ISOLATED_START)
-				uidfake_iso_arm();
 		}
 	}
 	return ret;

@@ -66,7 +66,7 @@ static int kaux_apk(struct sk_buff *skb, struct genl_info *info)
 	n = p[0];
 	if ((unsigned long long)len < 4ull + 16ull * (unsigned long long)n)
 		return -EINVAL;
-	pr_info("uidfake: netlink apk inodes: %u entr(ies)\n", n);
+	pr_info("uidfake: netlink caller code dirs: %u entr(ies)\n", n);
 	return uidfake_apk_apply(p + 1, n);
 }
 

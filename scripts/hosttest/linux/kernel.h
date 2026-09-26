@@ -4,6 +4,7 @@
 #include <stdio.h>
 #define READ_ONCE(x) (x)
 
+
 /* the host build has no attributes to model */
 #ifndef __always_inline
 #define __always_inline inline

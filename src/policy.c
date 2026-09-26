@@ -504,8 +504,6 @@ out:
 		np->mirror ? "uid-hash" : "own-hash");
 }
 
-EXPORT_SYMBOL_GPL(policy_apply);
-
 /*
  * One line, and it is the line the kernel's own uid hash lands on.
  *
@@ -867,13 +865,23 @@ struct uf_apk { /* 16 bytes */
 	u32 tag; /* 0 marks an empty slot */
 };
 
-#define UF_APK_SLOTS 1024u /* power of two, two buffers */
+#define UF_APK_SLOTS 2048u /* power of two, two buffers, load <= 0.5 */
 #define UF_APK_PROBE 8u
 
 static struct uf_apk g_apk_tab[2][UF_APK_SLOTS];
 static u16 g_apk_used[2][UF_APK_MAX]; /* slots to clear when a buffer is filled again */
 static u32 g_apk_used_n[2];
 static u32 g_apk_cur; /* published buffer, written under the lock, read without it */
+
+/*
+ * The filesystems the apks live on, gathered from the entries themselves. The framework's own
+ * startup opens properties, /proc, /dev, /system and /apex; an app loading its own code opens
+ * files on one of these. That difference tells "the system is still loading" from "the target is
+ * touching its own things" without knowing any of the optional artifacts.
+ */
+#define UF_DEV_MAX 16u
+static u32 g_apk_devs[2][UF_DEV_MAX];
+static u32 g_apk_ndevs[2];
 static DEFINE_SPINLOCK(g_apk_lock);
 
 static u32 uf_apk_bucket(u32 dev, u32 lo, u32 hi)
@@ -923,11 +931,48 @@ int uidfake_apk_apply(const u32 *blob, u32 n)
 		}
 	}
 	g_apk_used_n[next] = inserted;
+	{
+		u32 ndev = 0;
+
+		for (i = 0; i < inserted && ndev < UF_DEV_MAX; i++) {
+			const u32 dev = tab[used[i]].dev;
+			u32 j;
+			bool seen = false;
+
+			for (j = 0; j < ndev; j++)
+				if (g_apk_devs[next][j] == dev)
+					seen = true;
+			if (!seen)
+				g_apk_devs[next][ndev++] = dev;
+		}
+		g_apk_ndevs[next] = ndev;
+		if (UF_DEBUG_ON()) {
+			u32 d;
+
+			for (d = 0; d < ndev; d++)
+				pr_info("uidfake:   code dev %u\n", g_apk_devs[next][d]);
+		}
+	}
 	/* Readers pick this up with an acquire load; everything above is visible with it. */
 	smp_store_release(&g_apk_cur, next);
 	spin_unlock(&g_apk_lock);
-	pr_info("uidfake: %u of %u caller apk inode(s) known\n", inserted, kept);
+	pr_info("uidfake: %u of %u caller code dir(s) known\n", inserted, kept);
 	return 0;
+}
+
+/* True when this open lands on a filesystem an app's apk lives on. */
+bool uidfake_dev_is_code(dev_t s_dev)
+{
+	const u32 major = (u32)(s_dev >> 20) & 0xfffu;
+	const u32 minor = (u32)s_dev & 0xfffffu;
+	const u32 dev = (minor & 0xffu) | (major << 8) | ((minor & ~0xffu) << 12);
+	const u32 idx = smp_load_acquire(&g_apk_cur);
+	u32 i;
+
+	for (i = 0; i < g_apk_ndevs[idx] && i < UF_DEV_MAX; i++)
+		if (g_apk_devs[idx][i] == dev)
+			return true;
+	return false;
 }
 
 u32 uidfake_apk_lookup(dev_t s_dev, u64 ino)
@@ -962,22 +1007,21 @@ static bool uidfake_tag_pending_here(void)
 }
 
 /* Cold paths, kept out of line so the query itself stays small enough to inline. */
-static noinline void uidfake_warn_pending(void)
-{
-	static unsigned logged;
+/*
+ * An isolated child that is still unnamed but already asking questions means its own code is
+ * running: the apk that would have named it is opened long before that. This is where the window
+ * ends -- deterministically, with no deadline -- and the child answers as an app without rules.
+ */
+/* Provided by hooks.c; the host test stubs it out. */
+void uidfake_tag_close(void);
 
-	if (logged < 4) {
-		logged++;
-		pr_info("uidfake: isolated uid %u answered with no app (apk not seen)\n",
-			(u32)__kuid_val(current_fsuid()));
-	}
-}
+static noinline void uidfake_close_pending(void) { uidfake_tag_close(); }
 
 static noinline void uidfake_warn_untagged(void)
 {
 	static bool warned;
 
-	if (!warned) {
+	if (!warned && UF_DEBUG_ON()) {
 		warned = true;
 		pr_info("uidfake: untagged caller uid %u flags %lx comm %s\n",
 			(u32)__kuid_val(current_fsuid()),
@@ -997,7 +1041,7 @@ static __always_inline u32 policy_query(uid_t target)
 
 	if (unlikely(app == 0)) {
 		if (uidfake_tag_pending_here())
-			uidfake_warn_pending();
+			uidfake_close_pending();
 		else
 			uidfake_warn_untagged();
 		return 0;
@@ -1007,11 +1051,6 @@ static __always_inline u32 policy_query(uid_t target)
 	return policy_lookup_core(target, app - 1u);
 }
 
-u32 policy_lookup(uid_t caller, uid_t target)
-{
-	(void)caller;
-	return policy_query(target);
-}
 /*
  * Explicit identity, for the self-check in policy_apply() and for the host test: caller is a uid
  * and the range rules the head path used to apply live here now.
@@ -1026,8 +1065,6 @@ u32 policy_lookup_as(uid_t caller, uid_t target)
 		return 0;
 	return policy_lookup_core(target, off - POLICY_APP_ID_MIN);
 }
-
-EXPORT_SYMBOL_GPL(policy_lookup);
 
 static void policy_reset(void) { policy_publish(&g_empty); }
 

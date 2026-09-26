@@ -2,6 +2,7 @@
 #ifndef UIDFAKE_H
 #define UIDFAKE_H
 
+#include <linux/jump_label.h>
 #include <linux/sched.h>
 #include <linux/types.h>
 #include <linux/uidgid.h>
@@ -40,8 +41,16 @@ struct uid_pair { /* 8 bytes: POLICY_WAY of them fill one cache line */
 };
 
 void policy_apply(const u32 *pairs, u32 npairs);
+
+/*
+ * Diagnostics sit behind a static key: when it is off the branch is patched to a NOP, so a release
+ * build carries none of it. The module parameter turns it on at load and the work item below turns
+ * it off again, so a diagnostic run pays for itself only while it is running.
+ */
+extern struct static_key_false uidfake_debug_key;
+#define UF_DEBUG_ON() static_branch_unlikely(&uidfake_debug_key)
+void uidfake_debug_init(bool on);
 /* 0 = not hidden; otherwise the same-bucket replacement uid */
-u32 policy_lookup(uid_t caller, uid_t target);
 /* Explicit identity: the self-check in policy_apply() and the host test. */
 u32 policy_lookup_as(uid_t caller, uid_t target);
 
@@ -67,11 +76,12 @@ u32 policy_lookup_as(uid_t caller, uid_t target);
  */
 #define UF_TAG_PENDING (1UL << 55)
 
-#define UF_APK_MAX 512 /* caller apk inodes the kernel knows, pushed by the helper */
+#define UF_APK_MAX 1024 /* caller code dirs the kernel knows; a user may hide from hundreds */
 
 u32 uidfake_tag_app(void);		       /* app id + 1, or 0 when untagged */
 int uidfake_apk_apply(const u32 *blob, u32 n); /* n * (st_dev, ino_lo, ino_hi, uid) */
 u32 uidfake_apk_lookup(dev_t s_dev, u64 ino);
+bool uidfake_dev_is_code(dev_t s_dev); /* is this a filesystem an app apk lives on? */
 void uidfake_tag_adopt(u32 old_uid, u32 new_uid);
 void uidfake_tag_prime(void);
 void uidfake_tag_note(u32 before_sid, u32 after_sid, u32 old_uid, u32 new_uid);
