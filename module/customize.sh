@@ -4,15 +4,31 @@ SKIPUNZIP=0
 ui_print "- HMA UID Fake"
 
 # 6.1.138-android14-11-g0c3559bcd85-ab14529422 -> android14-6.1
+# The branch and the kernel version are two different things: the "11" in "android14-11" is a KMI
+# generation, not a kernel version, and a 5.15 kernel from the android14 branches reports
+# "android14-...". It is the branch that decides between two KMIs sharing a kernel version
+# (android13-5.15 and android14-5.15), so both parts are read here.
 kmi_from_uname() {
   _r="$(uname -r)"
-  _k="$(echo "$_r" | grep -oE 'android[0-9]+-[0-9]+\.[0-9]+' | head -n1)"
-  [ -n "$_k" ] && { echo "$_k"; return; }
-  _mm="$(echo "$_r" | grep -oE '^[0-9]+\.[0-9]+' | head -n1)"
+  _branch="$(echo "$_r" | grep -oE 'android[0-9]+' | head -n1)"
+  _ver="$(echo "$_r" | grep -oE '^[0-9]+\.[0-9]+' | head -n1)"
+
+  if [ -n "$_branch" ]; then
+    # The device names its branch, so only that branch's module will do: one from another branch
+    # has a different vermagic and the kernel would refuse it anyway.
+    echo "${_branch}-${_ver}"
+    return
+  fi
+
+  # No branch in the string (a vendor kernel): fall back to the kernel version alone, and say so
+  # when more than one KMI matches it.
+  _cands=""
   for _c in $(ls "$MODPATH/ko" 2>/dev/null | sed 's/_arm64_hma_uidfake\.ko$//' | sort -u); do
-    [ "${_c#*-}" = "$_mm" ] && { echo "$_c"; return; }
+    [ "${_c#*-}" = "$_ver" ] && _cands="$_cands $_c"
   done
-  echo ""
+  _cands="${_cands# }"
+  [ "$(echo "$_cands" | wc -w)" -gt 1 ] && ui_print "! $(uname -r) fits $_cands; taking the first"
+  echo "${_cands%% *}"
 }
 
 KMI="$(kmi_from_uname)"
