@@ -10,14 +10,15 @@
 #define POLICY_MAX_PAIRS 4096
 
 /*
- * Two tables. The target table is read on every query and is indexed like the kernel's own
- * uidhash (8 bucket pointers per line), with the masks of a whole line read either way; the
- * caller table is matched by uid and its cost may differ between callers. A target's mask is
- * a bitmap over dense hider ids, so a target can be hidden from any subset of the policy's
- * callers and the caller count is limited only by POLICY_MAX_CALLERS.
+ * Two tables. The target table is read on every query and is indexed like the
+ * kernel's own uidhash (8 bucket pointers per line), with the masks of a whole
+ * line read either way; the caller table is matched by uid and its cost may
+ * differ between callers. A target's mask is a bitmap over dense hider ids, so
+ * a target can be hidden from any subset of the policy's callers and the caller
+ * count is limited only by POLICY_MAX_CALLERS.
  */
 
-#define POLICY_WAY 8	   /* target slots per 64-byte line */
+#define POLICY_WAY 8 /* target slots per 64-byte line */
 #define POLICY_CLINE_WAY 8 /* caller slots per 64-byte line */
 #define POLICY_MIN_LINES 16
 #define POLICY_MAX_LINES 4096
@@ -43,9 +44,10 @@ struct uid_pair { /* 8 bytes: POLICY_WAY of them fill one cache line */
 void policy_apply(const u32 *pairs, u32 npairs);
 
 /*
- * Diagnostics sit behind a static key: when it is off the branch is patched to a NOP, so a release
- * build carries none of it. The module parameter turns it on at load and the work item below turns
- * it off again, so a diagnostic run pays for itself only while it is running.
+ * Diagnostics sit behind a static key: when it is off the branch is patched to
+ * a NOP, so a release build carries none of it. The module parameter turns it
+ * on at load and the work item below turns it off again, so a diagnostic run
+ * pays for itself only while it is running.
  */
 extern struct static_key_false uidfake_debug_key;
 #define UF_DEBUG_ON() static_branch_unlikely(&uidfake_debug_key)
@@ -55,33 +57,39 @@ void uidfake_debug_init(bool on);
 u32 policy_lookup_as(uid_t caller, uid_t target);
 
 /*
- * Identity tag: the app id a process was born with, kept in the free high bits of
- * thread_info.flags (bits 40..55, zero = untagged). It is written at the two moments an identity
- * is created - zygote handing an app uid to a fresh process, and app_zygote handing an isolated
- * uid to one - and never rewritten or cleared afterwards, while fork copies it, so an isolated or
- * app_zygote child keeps answering as the app it came from. That is what makes the caller identity
- * unforgeable: setuid() can no longer pick which hiding rules apply. Only the app id is stored,
- * because the policy is keyed by app id anyway.
+ * Identity tag: the app id a process was born with, kept in the free high bits
+ * of thread_info.flags (bits 40..55, zero = untagged). It is written at the two
+ * moments an identity is created - zygote handing an app uid to a fresh
+ * process, and app_zygote handing an isolated uid to one - and never rewritten
+ * or cleared afterwards, while fork copies it, so an isolated or app_zygote
+ * child keeps answering as the app it came from. That is what makes the caller
+ * identity unforgeable: setuid() can no longer pick which hiding rules apply.
+ * Only the app id is stored, because the policy is keyed by app id anyway.
  */
 #define UF_TAG_SHIFT 40
 #define UF_TAG_MASK 0xffffUL
 #define UF_APP_MIN POLICY_APP_ID_MIN
 #define UF_APP_SPAN POLICY_APP_ID_SPAN
-#define UF_ISOLATED_START 90000u /* KernelSU: app_zygote children are 90000-98999 too */
+#define UF_ISOLATED_START \
+	90000u /* KernelSU: app_zygote children are 90000-98999 too */
 
 /*
- * Isolated children are marked before they can be named: the flag sits above the identity inside
- * the same field so the hot path tests it with a single AND, without shifting the field out first
- * (an app id plus one never reaches bit 55).
+ * Isolated children are marked before they can be named: the flag sits above
+ * the identity inside the same field so the hot path tests it with a single
+ * AND, without shifting the field out first (an app id plus one never reaches
+ * bit 55).
  */
 #define UF_TAG_PENDING (1UL << 55)
 
-#define UF_APK_MAX 1024 /* caller code dirs the kernel knows; a user may hide from hundreds */
+#define UF_APK_MAX \
+	1024 /* caller code dirs the kernel knows; a user may hide from hundreds */
 
-u32 uidfake_tag_app(void);		       /* app id + 1, or 0 when untagged */
-int uidfake_apk_apply(const u32 *blob, u32 n); /* n * (st_dev, ino_lo, ino_hi, uid) */
+u32 uidfake_tag_app(void); /* app id + 1, or 0 when untagged */
+int uidfake_apk_apply(const u32 *blob,
+		      u32 n); /* n * (st_dev, ino_lo, ino_hi, uid) */
 u32 uidfake_apk_lookup(dev_t s_dev, u64 ino);
-bool uidfake_dev_is_code(dev_t s_dev); /* is this a filesystem an app apk lives on? */
+bool uidfake_dev_is_code(
+	dev_t s_dev); /* is this a filesystem an app apk lives on? */
 void uidfake_tag_adopt(u32 old_uid, u32 new_uid);
 void uidfake_tag_prime(void);
 void uidfake_tag_note(u32 before_sid, u32 after_sid, u32 old_uid, u32 new_uid);
@@ -97,14 +105,17 @@ int uidfake_patch_init(void);
 unsigned long uidfake_lookup(const char *name);
 
 /*
- * aarch64 branch helpers, kept inline so the host test can check the encoder: a direct
- * branch is 26 bits of word offset, i.e. +/-128 MB, which is exactly the reach that decides
- * whether a module can call into the kernel image.
+ * aarch64 branch helpers, kept inline so the host test can check the encoder: a
+ * direct branch is 26 bits of word offset, i.e. +/-128 MB, which is exactly the
+ * reach that decides whether a module can call into the kernel image.
  */
 #define ARM64_B 0x14000000u
 #define ARM64_BL 0x94000000u
 
-static inline bool arm64_is_bl(u32 insn) { return (insn & 0xFC000000u) == ARM64_BL; }
+static inline bool arm64_is_bl(u32 insn)
+{
+	return (insn & 0xFC000000u) == ARM64_BL;
+}
 
 static inline u32 arm64_branch(u32 op, unsigned long from, unsigned long to)
 {

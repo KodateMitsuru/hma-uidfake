@@ -1,0 +1,18 @@
+# The userspace helper: real bugs first, and the style is already handled by clang-format.
+#
+# Disabled on purpose:
+#   portability-avoid-pragma-once          -- these headers are C++ only and use #pragma once
+#   bugprone-easily-swappable-parameters   -- statistics functions take (mean, sd) pairs
+#   bugprone-reserved-identifier           -- _GNU_SOURCE is a feature macro, not an identifier
+#   performance-enum-size                  -- the two enums here are not stored in arrays
+#   clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+#                                          -- it asks for the C11 Annex K *_s functions
+Checks: >-
+  -*,clang-analyzer-*,bugprone-*,performance-*,portability-*,
+  -portability-avoid-pragma-once,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  -performance-enum-size,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+HeaderFilterRegex: '.*/hma-uidfake/src/tools/.*'
+WarningsAsErrors: ''

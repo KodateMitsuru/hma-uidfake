@@ -4,7 +4,6 @@
 #include <stdio.h>
 #define READ_ONCE(x) (x)
 
-
 /* the host build has no attributes to model */
 #ifndef __always_inline
 #define __always_inline inline
@@ -19,8 +18,12 @@
 #define noinline
 #endif
 
-/* the host has one thread, so the barriers around a published index are no-ops */
-#define smp_store_release(ptr, value) do { *(ptr) = (value); } while (0)
+/* the host has one thread, so the barriers around a published index are no-ops
+ */
+#define smp_store_release(ptr, value) \
+	do {                          \
+		*(ptr) = (value);     \
+	} while (0)
 #define smp_load_acquire(ptr) (*(ptr))
 #define pr_info(fmt, ...) fprintf(stderr, "[info] " fmt, ##__VA_ARGS__)
 #define pr_warn(fmt, ...) fprintf(stderr, "[warn] " fmt, ##__VA_ARGS__)

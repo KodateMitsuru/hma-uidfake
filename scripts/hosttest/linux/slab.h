@@ -24,5 +24,8 @@ static inline void *kmalloc_array(size_t n, size_t sz, int f)
 	(void)f;
 	return calloc(n, sz);
 }
-static inline void kfree(void *p) { free(p); }
+static inline void kfree(void *p)
+{
+	free(p);
+}
 #endif

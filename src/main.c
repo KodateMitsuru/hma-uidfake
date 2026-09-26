@@ -9,14 +9,17 @@
 
 struct static_key_false uidfake_debug_key;
 
-/* Diagnostics switch themselves off, so a run that enabled them leaves nothing behind. */
+/* Diagnostics switch themselves off, so a run that enabled them leaves nothing
+ * behind. */
 static void uidfake_debug_off(struct work_struct *work);
 static DECLARE_DELAYED_WORK(uidfake_debug_work, uidfake_debug_off);
 
-/* The parameter is a one-shot: it arms the key and the work item disarms it a minute later. */
+/* The parameter is a one-shot: it arms the key and the work item disarms it a
+ * minute later. */
 static bool uidfake_debug;
 module_param_named(debug, uidfake_debug, bool, 0644);
-MODULE_PARM_DESC(debug, "log the isolated-child naming for 60 seconds after load");
+MODULE_PARM_DESC(debug,
+		 "log the isolated-child naming for 60 seconds after load");
 
 static void uidfake_debug_off(struct work_struct *work)
 {
@@ -62,4 +65,5 @@ module_exit(uidfake_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("local");
-MODULE_DESCRIPTION("uidfake - kernel-side uid existence guard (netlink-injected policy)");
+MODULE_DESCRIPTION(
+	"uidfake - kernel-side uid existence guard (netlink-injected policy)");

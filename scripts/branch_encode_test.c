@@ -1,5 +1,6 @@
-/* Host test for the branch encoder in uidfake.h: this is the one piece that must be
- * exactly right, because a wrong encode writes garbage into kernel text.
+/* Host test for the branch encoder in uidfake.h: this is the one piece that
+ * must be exactly right, because a wrong encode writes garbage into kernel
+ * text.
  */
 #include "uidfake.h"
 #include <stdio.h>
@@ -29,10 +30,11 @@ static void expect_branch(unsigned long from, unsigned long to)
 
 int main(void)
 {
-	/* module region is up to 128 MB below the kernel image: the boundary matters */
+	/* module region is up to 128 MB below the kernel image: the boundary matters
+   */
 	unsigned long img = 0xffff800008000000UL; /* KIMAGE_VADDR */
 	unsigned long modhi = img - 0x1000;
-	unsigned long modlo = img - 0x07ff0000UL;  /* just inside */
+	unsigned long modlo = img - 0x07ff0000UL; /* just inside */
 	unsigned long modout = img - 0x08000000UL; /* exactly 128 MB: out */
 	unsigned long i;
 
@@ -41,7 +43,8 @@ int main(void)
 	expect_branch(img, modhi);
 	expect_branch(modhi, modhi + 0x100);
 	for (i = 0; i < 2000; i++)
-		expect_branch(0x1000 + i * 4096, 0x1000 + ((i * 7919) % 200000) * 4);
+		expect_branch(0x1000 + i * 4096,
+			      0x1000 + ((i * 7919) % 200000) * 4);
 	if (arm64_branch(ARM64_BL, modout, img))
 		printf("FAIL: exactly 128 MB accepted\n"), fails++;
 	if (arm64_branch(ARM64_BL, modhi + 1, img))

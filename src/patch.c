@@ -2,14 +2,15 @@
 /*
  * patch.c - write a few bytes into read-only kernel or module text.
  *
- * Kernel text is mapped read-only and the helpers that would normally make it writable
- * (set_memory_rw, text_poke) are not exported to modules. Instead the physical page is
- * translated through init_mm and mapped again writable with vmap(); the instruction cache
- * is cleaned afterwards and the synchronous path stops all other CPUs, because one of them
- * can be executing the very instruction being replaced.
+ * Kernel text is mapped read-only and the helpers that would normally make it
+ * writable (set_memory_rw, text_poke) are not exported to modules. Instead the
+ * physical page is translated through init_mm and mapped again writable with
+ * vmap(); the instruction cache is cleaned afterwards and the synchronous path
+ * stops all other CPUs, because one of them can be executing the very
+ * instruction being replaced.
  *
- * The technique is the one every out-of-tree patcher on arm64 ends up using; this is an
- * independent implementation.
+ * The technique is the one every out-of-tree patcher on arm64 ends up using;
+ * this is an independent implementation.
  */
 #include <asm/cacheflush.h>
 #include <asm/pgtable.h>
@@ -21,17 +22,22 @@
 
 #include "uidfake.h"
 
-static int probe_noop(struct kprobe *p, struct pt_regs *r) { return 0; }
+static int probe_noop(struct kprobe *p, struct pt_regs *r)
+{
+	return 0;
+}
 
 /*
- * Look up a kernel symbol by name. kallsyms_lookup_name() is not exported to modules, so its
- * own address is obtained from a probe registered on it (kprobe resolves .symbol_name through
- * kallsyms internally) and unregistered immediately -- nothing stays behind. This is how
- * KernelSU resolves symbols too.
+ * Look up a kernel symbol by name. kallsyms_lookup_name() is not exported to
+ * modules, so its own address is obtained from a probe registered on it (kprobe
+ * resolves .symbol_name through kallsyms internally) and unregistered
+ * immediately -- nothing stays behind. This is how KernelSU resolves symbols
+ * too.
  */
 unsigned long uidfake_lookup(const char *name)
 {
-	struct kprobe kp = {.symbol_name = "kallsyms_lookup_name", .pre_handler = probe_noop};
+	struct kprobe kp = { .symbol_name = "kallsyms_lookup_name",
+			     .pre_handler = probe_noop };
 	unsigned long (*fn)(const char *);
 
 	if (register_kprobe(&kp))
@@ -42,8 +48,9 @@ unsigned long uidfake_lookup(const char *name)
 }
 
 /*
- * Symbols the patcher needs at run time. init_mm is not exported, kimage_voffset/kallsyms are
- * not either, so all of them go through the same transient-probe resolver.
+ * Symbols the patcher needs at run time. init_mm is not exported,
+ * kimage_voffset/kallsyms are not either, so all of them go through the same
+ * transient-probe resolver.
  */
 static struct mm_struct *patch_mm;
 static unsigned long *g_kimage_voffset;
@@ -55,8 +62,8 @@ int uidfake_patch_init(void)
 	patch_mm = (struct mm_struct *)uidfake_lookup("init_mm");
 	g_kimage_voffset = (unsigned long *)uidfake_lookup("kimage_voffset");
 	g_memstart_addr = (unsigned long *)uidfake_lookup("memstart_addr");
-	pr_info("uidfake: init_mm=%px kimage_voffset=%px memstart_addr=%px\n", patch_mm,
-		(void *)g_kimage_voffset, (void *)g_memstart_addr);
+	pr_info("uidfake: init_mm=%px kimage_voffset=%px memstart_addr=%px\n",
+		patch_mm, (void *)g_kimage_voffset, (void *)g_memstart_addr);
 	return patch_mm ? 0 : -ENOENT;
 }
 struct patch_req {
@@ -66,9 +73,10 @@ struct patch_req {
 };
 
 /*
- * The 4 KB page backing a kernel address, plus the offset inside it. Kernel .rodata (where
- * sys_call_table lives) is often mapped as a 2 MB block, and the image as 1 GB blocks, so
- * block mappings have to be resolved to the page inside them instead of being rejected.
+ * The 4 KB page backing a kernel address, plus the offset inside it. Kernel
+ * .rodata (where sys_call_table lives) is often mapped as a 2 MB block, and the
+ * image as 1 GB blocks, so block mappings have to be resolved to the page
+ * inside them instead of being rejected.
  */
 static struct page *kernel_page(unsigned long addr, unsigned long *off)
 {
@@ -89,14 +97,16 @@ static struct page *kernel_page(unsigned long addr, unsigned long *off)
 		return NULL;
 	*off = offset_in_page(addr);
 	if (pud_leaf(*pud)) {
-		phys = (phys_addr_t)(pud_val(*pud) & ~(PUD_SIZE - 1)) + (addr & (PUD_SIZE - 1));
+		phys = (phys_addr_t)(pud_val(*pud) & ~(PUD_SIZE - 1)) +
+		       (addr & (PUD_SIZE - 1));
 		return pfn_to_page(phys >> PAGE_SHIFT);
 	}
 	pmd = pmd_offset(pud, addr);
 	if (pmd_none(*pmd) || pmd_bad(*pmd))
 		return NULL;
 	if (pmd_leaf(*pmd)) {
-		phys = (phys_addr_t)(pmd_val(*pmd) & ~(PMD_SIZE - 1)) + (addr & (PMD_SIZE - 1));
+		phys = (phys_addr_t)(pmd_val(*pmd) & ~(PMD_SIZE - 1)) +
+		       (addr & (PMD_SIZE - 1));
 		return pfn_to_page(phys >> PAGE_SHIFT);
 	}
 	pte = pte_offset_kernel(pmd, addr);
@@ -105,9 +115,10 @@ static struct page *kernel_page(unsigned long addr, unsigned long *off)
 	return pte_page(*pte);
 }
 /*
- * Cache maintenance inlined by hand: __builtin___clear_cache() lowers to a call to
- * __clear_cache(), which the kernel does not export (the module would fail to load with
- * "Unknown symbol __clear_cache").
+ * Cache maintenance inlined by hand: __builtin___clear_cache() lowers to a call
+ * to
+ * __clear_cache(), which the kernel does not export (the module would fail to
+ * load with "Unknown symbol __clear_cache").
  */
 static unsigned long cache_dline(void)
 {
@@ -143,17 +154,18 @@ static void cache_clean_inval(void *addr, size_t len)
 }
 
 /*
- * Physical address of a kernel image address without walking page tables: with KASLR the image
- * is offset by kimage_voffset, so pa = va - kimage_voffset. Used when the walk cannot resolve
- * the address, for instance because struct mm_struct differs from the tree this module was
- * built against.
+ * Physical address of a kernel image address without walking page tables: with
+ * KASLR the image is offset by kimage_voffset, so pa = va - kimage_voffset.
+ * Used when the walk cannot resolve the address, for instance because struct
+ * mm_struct differs from the tree this module was built against.
  */
 static phys_addr_t image_phys(unsigned long addr)
 {
 	if (g_kimage_voffset)
 		return (phys_addr_t)(addr - *g_kimage_voffset);
 	if (g_memstart_addr)
-		return (phys_addr_t)(addr - (unsigned long)(KIMAGE_VADDR - *g_memstart_addr));
+		return (phys_addr_t)(addr - (unsigned long)(KIMAGE_VADDR -
+							    *g_memstart_addr));
 	return 0;
 }
 
@@ -169,8 +181,8 @@ static struct page *page_for(unsigned long addr, unsigned long *off)
 		return NULL;
 	if (!g_walk_warned) {
 		g_walk_warned = true;
-		pr_info(
-		    "uidfake: page table walk unusable (vendor mm_struct); using kimage_voffset\n");
+		pr_info("uidfake: page table walk unusable (vendor mm_struct); using "
+			"kimage_voffset\n");
 	}
 	return pfn_to_page(phys >> PAGE_SHIFT);
 }
@@ -192,14 +204,15 @@ static int patch_do(void *arg)
 		return -ENOMEM;
 	}
 	memcpy(alias + off, r->src, r->len);
-	/* the line is physically tagged, so cleaning through the alias covers the target too */
+	/* the line is physically tagged, so cleaning through the alias covers the
+   * target too */
 	vunmap(alias);
 	return 0;
 }
 
 int uidfake_patch_text(void *dst, const void *src, size_t len, bool sync)
 {
-	struct patch_req req = {.addr = dst, .src = src, .len = len};
+	struct patch_req req = { .addr = dst, .src = src, .len = len };
 	int ret;
 
 	if (!len || (unsigned long)dst & 3 || len & 3)

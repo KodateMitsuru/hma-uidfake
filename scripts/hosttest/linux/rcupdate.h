@@ -6,17 +6,17 @@
 #define rcu_dereference(p) (p)
 #define rcu_access_pointer(p) (p)
 #define rcu_dereference_protected(p, c) ((void)(c), (p))
-#define rcu_assign_pointer(p, v)                                                                   \
-	do {                                                                                       \
-		(p) = (v);                                                                         \
+#define rcu_assign_pointer(p, v) \
+	do {                     \
+		(p) = (v);       \
 	} while (0)
-#define rcu_read_lock()                                                                            \
-	do {                                                                                       \
+#define rcu_read_lock() \
+	do {            \
 	} while (0)
-#define rcu_read_unlock()                                                                          \
-	do {                                                                                       \
+#define rcu_read_unlock() \
+	do {              \
 	} while (0)
-#define synchronize_rcu()                                                                          \
-	do {                                                                                       \
+#define synchronize_rcu() \
+	do {              \
 	} while (0)
 #endif
