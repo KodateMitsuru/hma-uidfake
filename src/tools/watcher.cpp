@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "watcher.hpp"
 
-#include <algorithm>
-#include <array>
-#include <cstring>
-#include <ranges>
-
 #include <dlfcn.h>
 #include <poll.h>
 #include <sys/inotify.h>
 #include <sys/system_properties.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
+
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <ranges>
 
 namespace uidfake {
 namespace {
@@ -34,24 +34,24 @@ constexpr std::string_view kPackagesPrefix = "packages.";
  * nothing to watch and nothing readable anyway - block on the property itself instead of
  * waking up every second. Returns whether the storage is open now.
  */
-using PropWait = int (*)(const prop_info *, std::uint32_t, std::uint32_t *, const timespec *);
+using PropWait = int (*)(const prop_info*, std::uint32_t, std::uint32_t*, const timespec*);
 
 [[nodiscard]] bool wait_for_unlock() {
-    if (ce_available())
-        return true;
+    if (ce_available()) return true;
 
     /*
      * __system_property_wait() is exported by the platform libc but not by the NDK stubs, so it
      * is resolved at run time; a 5 s slice only matters if the property never changes at all.
      */
-    static const auto wait_fn = reinterpret_cast<PropWait>(::dlsym(RTLD_DEFAULT, "__system_property_wait"));
-    const prop_info *info = __system_property_find("sys.user.0.ce_available");
+    static const auto wait_fn =
+        reinterpret_cast<PropWait>(::dlsym(RTLD_DEFAULT, "__system_property_wait"));
+    const prop_info* info = __system_property_find("sys.user.0.ce_available");
     constexpr int kSliceSeconds = 5;
 
     if (wait_fn && info) {
         const std::uint32_t serial = __system_property_serial(info);
         std::uint32_t fresh = serial;
-        timespec slice{ .tv_sec = kSliceSeconds, .tv_nsec = 0 };
+        timespec slice{.tv_sec = kSliceSeconds, .tv_nsec = 0};
         wait_fn(info, serial, &fresh, &slice);
     } else {
         ::sleep(kSliceSeconds);
@@ -66,8 +66,8 @@ constexpr std::uint32_t kDirEvents =
 
 }  // namespace
 
-bool Watcher::open(const std::filesystem::path &config,
-                   const std::filesystem::path &packages_list) {
+bool Watcher::open(const std::filesystem::path& config,
+                   const std::filesystem::path& packages_list) {
     inotify_.reset(::inotify_init1(IN_CLOEXEC | IN_NONBLOCK));
     if (!inotify_.valid()) {
         Log::warn("inotify_init1: {}", std::strerror(errno));
@@ -87,10 +87,10 @@ bool Watcher::open(const std::filesystem::path &config,
      * of the process (that is how changes went missing).
      */
     desired_ = {
-        { .path = config, .mask = kFileEvents },
-        { .path = config.parent_path(), .mask = kDirEvents },
-        { .path = packages_list, .mask = kFileEvents },
-        { .path = "/data/system", .mask = kDirEvents },
+        {.path = config, .mask = kFileEvents},
+        {.path = config.parent_path(), .mask = kDirEvents},
+        {.path = packages_list, .mask = kFileEvents},
+        {.path = "/data/system", .mask = kDirEvents},
     };
     apply_watches();
 
@@ -105,18 +105,18 @@ bool Watcher::open(const std::filesystem::path &config,
 }
 
 void Watcher::apply_watches() {
-    for (const auto &want : desired_)
-        add(want.path, want.mask);
+    for (const auto& want : desired_) add(want.path, want.mask);
 }
 
 bool Watcher::watches_complete() const {
-    return std::ranges::all_of(desired_, [](const Watch &w) { return !w.warned; });
+    return std::ranges::all_of(desired_, [](const Watch& w) { return !w.warned; });
 }
 
-void Watcher::add(const std::filesystem::path &path, std::uint32_t mask) {
+void Watcher::add(const std::filesystem::path& path, std::uint32_t mask) {
     /* Remember which of the wanted watches are not armed yet: that is also what tells the
      * resync timer to come back sooner, since these paths only appear once /data is unlocked. */
-    const auto wanted = std::ranges::find_if(desired_, [&](const Watch &w) { return w.path == path; });
+    const auto wanted =
+        std::ranges::find_if(desired_, [&](const Watch& w) { return w.path == path; });
 
     const int wd = ::inotify_add_watch(inotify_.get(), path.c_str(), mask);
     if (wd < 0) {
@@ -131,13 +131,13 @@ void Watcher::add(const std::filesystem::path &path, std::uint32_t mask) {
         wanted->warned = false;
         Log::info("watching {} now", path.string());
     }
-    for (auto &watch : watches_) {
+    for (auto& watch : watches_) {
         if (watch.wd == wd) {
-            watch = Watch{ .wd = wd, .path = path, .mask = mask };
+            watch = Watch{.wd = wd, .path = path, .mask = mask};
             return;
         }
     }
-    watches_.push_back(Watch{ .wd = wd, .path = path, .mask = mask });
+    watches_.push_back(Watch{.wd = wd, .path = path, .mask = mask});
 }
 
 void Watcher::arm_debounce() {
@@ -164,13 +164,12 @@ void Watcher::arm_debounce() {
 bool Watcher::handle_inotify_events() {
     std::array<char, 64 * 1024> buffer{};
     const ssize_t count = ::read(inotify_.get(), buffer.data(), buffer.size());
-    if (count <= 0)
-        return false;
+    if (count <= 0) return false;
 
     bool interesting = false;
     bool rearm = false;
     for (ssize_t offset = 0; offset < count;) {
-        const auto *event = reinterpret_cast<const inotify_event *>(buffer.data() + offset);
+        const auto* event = reinterpret_cast<const inotify_event*>(buffer.data() + offset);
         offset += static_cast<ssize_t>(sizeof(*event)) + event->len;
 
         if (event->mask & IN_Q_OVERFLOW) {
@@ -189,18 +188,16 @@ bool Watcher::handle_inotify_events() {
             /* A file we could not watch before may exist now, or vice versa. */
             rearm = true;
         }
-        if (event->len > 0 && !std::string_view{ event->name }.starts_with(kPackagesPrefix)) {
-            const bool watches_data_system = std::ranges::any_of(watches_, [&](const Watch &w) {
+        if (event->len > 0 && !std::string_view{event->name}.starts_with(kPackagesPrefix)) {
+            const bool watches_data_system = std::ranges::any_of(watches_, [&](const Watch& w) {
                 return w.wd == event->wd && w.path == "/data/system";
             });
-            if (watches_data_system)
-                continue;
+            if (watches_data_system) continue;
         }
         interesting = true;
     }
 
-    if (rearm)
-        apply_watches();
+    if (rearm) apply_watches();
 
     return interesting;
 }
@@ -208,9 +205,9 @@ bool Watcher::handle_inotify_events() {
 std::optional<Watcher::Tick> Watcher::wait() {
     for (;;) {
         std::array<pollfd, 3> fds{{
-            { .fd = inotify_.get(), .events = POLLIN, .revents = 0 },
-            { .fd = debounce_.get(), .events = POLLIN, .revents = 0 },
-            { .fd = resync_.get(), .events = POLLIN, .revents = 0 },
+            {.fd = inotify_.get(), .events = POLLIN, .revents = 0},
+            {.fd = debounce_.get(), .events = POLLIN, .revents = 0},
+            {.fd = resync_.get(), .events = POLLIN, .revents = 0},
         }};
 
         /*
@@ -219,8 +216,7 @@ std::optional<Watcher::Tick> Watcher::wait() {
          * without it made the caller come straight back and spin.
          */
         if (!ce_) {
-            if (!wait_for_unlock())
-                continue;
+            if (!wait_for_unlock()) continue;
             ce_ = true;
             Log::info("credential storage is open (device unlocked)");
             return Tick::Resync;
@@ -229,8 +225,7 @@ std::optional<Watcher::Tick> Watcher::wait() {
         /* After the unlock a one second tick doubles as the closure check. */
         const int ready = ::poll(fds.data(), fds.size(), 1000);
         if (ready < 0) {
-            if (errno == EINTR)
-                continue;
+            if (errno == EINTR) continue;
             Log::warn("poll: {}", std::strerror(errno));
             return std::nullopt;
         }
@@ -242,8 +237,7 @@ std::optional<Watcher::Tick> Watcher::wait() {
             }
             continue;
         }
-        if (fds[0].revents != 0 && handle_inotify_events())
-            arm_debounce();
+        if (fds[0].revents != 0 && handle_inotify_events()) arm_debounce();
 
         std::uint64_t expirations = 0;
         if (fds[1].revents != 0 && ::read(debounce_.get(), &expirations, sizeof(expirations)) > 0) {

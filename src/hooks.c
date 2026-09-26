@@ -8,8 +8,8 @@
 #include <linux/sched.h>
 #include <linux/string.h>
 #include <linux/syscalls.h>
-#include <linux/user.h>
 #include <linux/uidgid.h>
+#include <linux/user.h>
 
 #include "uidfake.h"
 
@@ -17,8 +17,8 @@
  * can then inline it into the syscall wrappers instead of paying a call for every query */
 #include "policy.c"
 
-#define ARG_UID 0	/* find_user(kuid_t uid): uid in x0 */
-#define ARG_WHO 1	/* getpriority/setpriority/ioprio_get/ioprio_set: (which, who, ...) */
+#define ARG_UID 0 /* find_user(kuid_t uid): uid in x0 */
+#define ARG_WHO 1 /* getpriority/setpriority/ioprio_get/ioprio_set: (which, who, ...) */
 
 /* syscall_fn_t is not declared for every KMI the module builds against */
 typedef long (*uidfake_syscall_t)(const struct pt_regs *);
@@ -46,11 +46,26 @@ asmlinkage long uidfake_setpriority(const struct pt_regs *regs);
 asmlinkage long uidfake_ioprio_get(const struct pt_regs *regs);
 asmlinkage long uidfake_ioprio_set(const struct pt_regs *regs);
 
+/* The id setters: declared here because the tables below already use them. */
+static asmlinkage long uidfake_setuid(const struct pt_regs *regs);
+static asmlinkage long uidfake_setreuid(const struct pt_regs *regs);
+static asmlinkage long uidfake_setresuid(const struct pt_regs *regs);
+static asmlinkage long uidfake_setgid(const struct pt_regs *regs);
+static asmlinkage long uidfake_setregid(const struct pt_regs *regs);
+static asmlinkage long uidfake_setresgid(const struct pt_regs *regs);
+static asmlinkage long uidfake32_setuid(const struct pt_regs *regs);
+static asmlinkage long uidfake32_setreuid(const struct pt_regs *regs);
+static asmlinkage long uidfake32_setresuid(const struct pt_regs *regs);
+static asmlinkage long uidfake32_setgid(const struct pt_regs *regs);
+static asmlinkage long uidfake32_setregid(const struct pt_regs *regs);
+static asmlinkage long uidfake32_setresgid(const struct pt_regs *regs);
+
 static struct hook_entry g_hook[] = {
-	{ __NR_getpriority, uidfake_getpriority, NULL },
-	{ __NR_setpriority, uidfake_setpriority, NULL },
-	{ __NR_ioprio_get, uidfake_ioprio_get, NULL },
-	{ __NR_ioprio_set, uidfake_ioprio_set, NULL },
+    {__NR_getpriority, uidfake_getpriority, NULL}, {__NR_setpriority, uidfake_setpriority, NULL},
+    {__NR_ioprio_get, uidfake_ioprio_get, NULL},   {__NR_ioprio_set, uidfake_ioprio_set, NULL},
+    {__NR_setuid, uidfake_setuid, NULL},	   {__NR_setreuid, uidfake_setreuid, NULL},
+    {__NR_setresuid, uidfake_setresuid, NULL},	   {__NR_setgid, uidfake_setgid, NULL},
+    {__NR_setregid, uidfake_setregid, NULL},	   {__NR_setresgid, uidfake_setresgid, NULL},
 };
 
 /*
@@ -61,8 +76,14 @@ static struct hook_entry g_hook[] = {
 #ifdef CONFIG_COMPAT
 #define NR32_GETPRIORITY 141
 #define NR32_SETPRIORITY 140
-#define NR32_IOPRIO_SET  314
-#define NR32_IOPRIO_GET  315
+#define NR32_IOPRIO_SET 314
+#define NR32_IOPRIO_GET 315
+#define NR32_SETUID 23
+#define NR32_SETGID 46
+#define NR32_SETREUID 70
+#define NR32_SETREGID 71
+#define NR32_SETRESUID 164
+#define NR32_SETRESGID 170
 
 asmlinkage long uidfake32_getpriority(const struct pt_regs *regs);
 asmlinkage long uidfake32_setpriority(const struct pt_regs *regs);
@@ -70,10 +91,16 @@ asmlinkage long uidfake32_ioprio_get(const struct pt_regs *regs);
 asmlinkage long uidfake32_ioprio_set(const struct pt_regs *regs);
 
 static struct hook_entry g_chook[] = {
-	{ NR32_GETPRIORITY, uidfake32_getpriority, NULL },
-	{ NR32_SETPRIORITY, uidfake32_setpriority, NULL },
-	{ NR32_IOPRIO_GET, uidfake32_ioprio_get, NULL },
-	{ NR32_IOPRIO_SET, uidfake32_ioprio_set, NULL },
+    {NR32_GETPRIORITY, uidfake32_getpriority, NULL},
+    {NR32_SETPRIORITY, uidfake32_setpriority, NULL},
+    {NR32_IOPRIO_GET, uidfake32_ioprio_get, NULL},
+    {NR32_IOPRIO_SET, uidfake32_ioprio_set, NULL},
+    {NR32_SETUID, uidfake32_setuid, NULL},
+    {NR32_SETREUID, uidfake32_setreuid, NULL},
+    {NR32_SETRESUID, uidfake32_setresuid, NULL},
+    {NR32_SETGID, uidfake32_setgid, NULL},
+    {NR32_SETREGID, uidfake32_setregid, NULL},
+    {NR32_SETRESGID, uidfake32_setresgid, NULL},
 };
 #endif
 
@@ -99,7 +126,7 @@ static asmlinkage long uid_hook(const struct pt_regs *regs, unsigned which_user,
 	if ((u32)regs->regs[0] != which_user)
 		return orig(regs);
 
-	repl = policy_lookup_fast((u32)__kuid_val(current_fsuid()), (u32)regs->regs[ARG_WHO]);
+	repl = policy_lookup((u32)__kuid_val(current_fsuid()), (u32)regs->regs[ARG_WHO]);
 	copy.regs[ARG_WHO] = repl ? (u64)repl : regs->regs[ARG_WHO];
 	return orig(&copy);
 }
@@ -178,8 +205,8 @@ static void unpatch_entries(uidfake_syscall_t *table, struct hook_entry *e, unsi
 		return;
 	for (i = 0; i < n; i++) {
 		if (e[i].orig)
-			uidfake_patch_text(&table[e[i].nr], &e[i].orig,
-					   sizeof(uidfake_syscall_t), true);
+			uidfake_patch_text(&table[e[i].nr], &e[i].orig, sizeof(uidfake_syscall_t),
+					   true);
 		e[i].orig = NULL;
 	}
 }
@@ -201,6 +228,10 @@ static int patch_tables(void)
 		return -EIO;
 	}
 	pr_info("uidfake: %u uid syscall(s) hooked in sys_call_table\n", n);
+	/*
+	 * Off by default: the probe exercises the sid->context call, and if the call shape were
+	 * ever
+	 */
 
 #ifdef CONFIG_COMPAT
 	table = uidfake_lookup("compat_sys_call_table");
@@ -209,7 +240,8 @@ static int patch_tables(void)
 		n = patch_entries(compat_table, g_chook, ARRAY_SIZE(g_chook));
 		if (n != ARRAY_SIZE(g_chook)) {
 			unpatch_entries(compat_table, g_chook, ARRAY_SIZE(g_chook));
-			pr_warn("uidfake: 32-bit compat table not hooked; 32-bit callers are uncovered\n");
+			pr_warn("uidfake: 32-bit compat table not hooked; 32-bit callers are "
+				"uncovered\n");
 		} else {
 			pr_info("uidfake: %u uid syscall(s) hooked in compat_sys_call_table\n", n);
 		}
@@ -221,8 +253,10 @@ static int patch_tables(void)
 int hooks_install(void)
 {
 	/* the sys_call_table patch is the only hook now: no kprobe fallback */
-	if (!patch_tables())
+	if (!patch_tables()) {
+		uidfake_tag_prime(); /* give the processes that already run their tag */
 		return 1;
+	}
 
 	pr_warn("uidfake: could not hook sys_call_table, no hook installed\n");
 	return 0;
@@ -240,4 +274,107 @@ void hooks_remove(void)
 	compat_table = NULL;
 #endif
 	main_table = NULL;
+}
+
+/*
+ * The id setters. Their work happens on the way back, on the syscall's return value, which is why
+ * they need their own helper. All twelve wrappers (uid and gid, native and compat) run the same
+ * code, so no member of the family stands out, and a gid syscall cannot tag anything because
+ * uidfake_tag_adopt() reads the fsuid, which only the uid syscalls change.
+ */
+/* security_cred_getsecid() is exported; its declaration is not in every header set we use. */
+extern void security_cred_getsecid(const struct cred *cred, u32 *secid);
+
+/*
+ * The id setters. The SIDs are captured around the call so that the two ends of an identity
+ * change can be linked: the SID map that identifies isolated processes is built from here.
+ */
+
+/*
+ * The id setters. Both ends of a transition are captured so the SID map that identifies isolated
+ * processes can be built from it; the before side has to be read before the syscall runs, because
+ * the transition itself changes it. Work is skipped when nothing can be learned: only a change that
+ * ends on an app uid or an isolated uid matters.
+ */
+static asmlinkage long uid_change_hook(const struct pt_regs *regs, uidfake_syscall_t orig)
+{
+	const u32 before = (u32)__kuid_val(current_fsuid());
+	const bool interesting = before == 0 || (before % 100000u) >= UF_APP_MIN;
+	u32 before_sid = 0, after_sid = 0;
+	long ret;
+
+	if (interesting)
+		security_cred_getsecid(current->real_cred, &before_sid);
+
+	ret = orig(regs);
+	if (ret == 0 && interesting) {
+		const u32 after = (u32)__kuid_val(current_fsuid());
+
+		if ((after % 100000u) >= UF_APP_MIN) {
+			security_cred_getsecid(current->real_cred, &after_sid);
+			uidfake_tag_adopt(before, after);
+			uidfake_tag_note(before_sid, after_sid, before, after);
+		}
+	}
+	return ret;
+}
+
+static asmlinkage long uidfake_setuid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_hook[4].orig);
+}
+
+static asmlinkage long uidfake_setreuid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_hook[5].orig);
+}
+
+static asmlinkage long uidfake_setresuid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_hook[6].orig);
+}
+
+static asmlinkage long uidfake_setgid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_hook[7].orig);
+}
+
+static asmlinkage long uidfake_setregid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_hook[8].orig);
+}
+
+static asmlinkage long uidfake_setresgid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_hook[9].orig);
+}
+
+static asmlinkage long uidfake32_setuid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_chook[0].orig);
+}
+
+static asmlinkage long uidfake32_setreuid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_chook[1].orig);
+}
+
+static asmlinkage long uidfake32_setresuid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_chook[2].orig);
+}
+
+static asmlinkage long uidfake32_setgid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_chook[3].orig);
+}
+
+static asmlinkage long uidfake32_setregid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_chook[4].orig);
+}
+
+static asmlinkage long uidfake32_setresgid(const struct pt_regs *regs)
+{
+	return uid_change_hook(regs, g_chook[5].orig);
 }

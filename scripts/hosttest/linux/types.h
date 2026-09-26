@@ -1,8 +1,8 @@
 #ifndef _FAKE_TYPES_H
 #define _FAKE_TYPES_H
-#include <stdint.h>
-#include <stddef.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 typedef uint8_t u8;
 typedef uint16_t u16;

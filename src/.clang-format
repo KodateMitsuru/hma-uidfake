@@ -1,0 +1,12 @@
+# Kernel module sources: the kernel's own style (tabs, 8 columns).
+BasedOnStyle: LLVM
+IndentWidth: 8
+UseTab: Always
+TabWidth: 8
+ColumnLimit: 100
+BreakBeforeBraces: Linux
+AllowShortIfStatementsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+IndentCaseLabels: false
+AlignConsecutiveMacros: false
+AlignConsecutiveAssignments: false

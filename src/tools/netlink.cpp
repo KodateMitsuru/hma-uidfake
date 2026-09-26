@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "netlink.hpp"
 
-#include <cstring>
-#include <vector>
-
-#include <sys/time.h>
-
-#include <sys/socket.h>
-
 #include <linux/genetlink.h>
 #include <linux/netlink.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+
+#include <cstring>
+#include <vector>
 
 namespace uidfake {
 namespace {
@@ -18,26 +16,24 @@ namespace {
  * The NDK UAPI headers only ship NLA_ALIGN/NLA_HDRLEN plus macros that do not handle
  * const pointers, so iterate explicitly with a byte cursor and these two predicates.
  */
-[[nodiscard]] bool nlmsg_ok(const nlmsghdr *header, int left) {
-    return left >= static_cast<int>(sizeof(nlmsghdr)) &&
-           header->nlmsg_len >= sizeof(nlmsghdr) &&
+[[nodiscard]] bool nlmsg_ok(const nlmsghdr* header, int left) {
+    return left >= static_cast<int>(sizeof(nlmsghdr)) && header->nlmsg_len >= sizeof(nlmsghdr) &&
            static_cast<int>(header->nlmsg_len) <= left;
 }
 
-[[nodiscard]] bool nlattr_ok(const nlattr *attr, int left) {
-    return left >= static_cast<int>(sizeof(nlattr)) &&
-           attr->nla_len >= sizeof(nlattr) &&
+[[nodiscard]] bool nlattr_ok(const nlattr* attr, int left) {
+    return left >= static_cast<int>(sizeof(nlattr)) && attr->nla_len >= sizeof(nlattr) &&
            static_cast<int>(attr->nla_len) <= left;
 }
 
-[[nodiscard]] const nlmsghdr *nlmsg_next(const nlmsghdr *header) {
-    return reinterpret_cast<const nlmsghdr *>(reinterpret_cast<const std::byte *>(header) +
-                                              NLMSG_ALIGN(header->nlmsg_len));
+[[nodiscard]] const nlmsghdr* nlmsg_next(const nlmsghdr* header) {
+    return reinterpret_cast<const nlmsghdr*>(reinterpret_cast<const std::byte*>(header) +
+                                             NLMSG_ALIGN(header->nlmsg_len));
 }
 
-[[nodiscard]] const nlattr *nlattr_next(const nlattr *attr) {
-    return reinterpret_cast<const nlattr *>(reinterpret_cast<const std::byte *>(attr) +
-                                            NLA_ALIGN(attr->nla_len));
+[[nodiscard]] const nlattr* nlattr_next(const nlattr* attr) {
+    return reinterpret_cast<const nlattr*>(reinterpret_cast<const std::byte*>(attr) +
+                                           NLA_ALIGN(attr->nla_len));
 }
 
 /* Little endian, matching the kernel side (see src/netlink.c). */
@@ -52,9 +48,9 @@ void store_u32(std::span<std::byte> out, std::size_t index, std::uint32_t value)
 struct Buffer {
     std::vector<std::byte> bytes;
 
-    [[nodiscard]] nlmsghdr *nlmsg() { return reinterpret_cast<nlmsghdr *>(bytes.data()); }
-    [[nodiscard]] genlmsghdr *genlmsg() {
-        return reinterpret_cast<genlmsghdr *>(bytes.data() + NLMSG_HDRLEN);
+    [[nodiscard]] nlmsghdr* nlmsg() { return reinterpret_cast<nlmsghdr*>(bytes.data()); }
+    [[nodiscard]] genlmsghdr* genlmsg() {
+        return reinterpret_cast<genlmsghdr*>(bytes.data() + NLMSG_HDRLEN);
     }
 };
 
@@ -64,7 +60,7 @@ bool NetlinkClient::exchange(std::span<const std::byte> request, std::span<std::
     sockaddr_nl address{};
     address.nl_family = AF_NETLINK;
 
-    iovec iov{ .iov_base = const_cast<std::byte *>(request.data()), .iov_len = request.size() };
+    iovec iov{.iov_base = const_cast<std::byte*>(request.data()), .iov_len = request.size()};
     msghdr message{};
     message.msg_name = &address;
     message.msg_namelen = sizeof(address);
@@ -86,7 +82,7 @@ bool NetlinkClient::exchange(std::span<const std::byte> request, std::span<std::
         return false;
     }
 
-    const auto *header = reinterpret_cast<const nlmsghdr *>(reply.data());
+    const auto* header = reinterpret_cast<const nlmsghdr*>(reply.data());
     bool answered = false;
     for (int left = static_cast<int>(received); nlmsg_ok(header, left);) {
         const int step = static_cast<int>(NLMSG_ALIGN(header->nlmsg_len));
@@ -97,7 +93,7 @@ bool NetlinkClient::exchange(std::span<const std::byte> request, std::span<std::
             continue;
         }
         if (header->nlmsg_type == NLMSG_ERROR) {
-            const auto *error = reinterpret_cast<const nlmsgerr *>(NLMSG_DATA(header));
+            const auto* error = reinterpret_cast<const nlmsgerr*>(NLMSG_DATA(header));
             if (error->error != 0) {
                 Log::warn("netlink error: {}", std::strerror(-error->error));
                 return false;
@@ -111,45 +107,42 @@ bool NetlinkClient::exchange(std::span<const std::byte> request, std::span<std::
 }
 
 std::optional<std::uint16_t> NetlinkClient::resolve_family() {
-    if (!ensure_connected())
-        return std::nullopt;
+    if (!ensure_connected()) return std::nullopt;
 
     Buffer request{};
     const std::size_t name_len = kFamilyName.size() + 1;
-    request.bytes.assign(NLMSG_SPACE(GENL_HDRLEN) + NLA_HDRLEN + name_len, std::byte{ 0 });
+    request.bytes.assign(NLMSG_SPACE(GENL_HDRLEN) + NLA_HDRLEN + name_len, std::byte{0});
 
-    auto *nlh = request.nlmsg();
+    auto* nlh = request.nlmsg();
     nlh->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN + NLA_HDRLEN + static_cast<int>(name_len));
     nlh->nlmsg_type = GENL_ID_CTRL;
     nlh->nlmsg_flags = NLM_F_REQUEST;
     nlh->nlmsg_seq = ++seq_;
 
-    auto *genl = request.genlmsg();
+    auto* genl = request.genlmsg();
     genl->cmd = CTRL_CMD_GETFAMILY;
     genl->version = 1;
 
-    auto *attr = reinterpret_cast<nlattr *>(reinterpret_cast<std::byte *>(genl) + GENL_HDRLEN);
+    auto* attr = reinterpret_cast<nlattr*>(reinterpret_cast<std::byte*>(genl) + GENL_HDRLEN);
     attr->nla_type = CTRL_ATTR_FAMILY_NAME;
     attr->nla_len = NLA_HDRLEN + static_cast<int>(name_len);
-    std::memcpy(reinterpret_cast<std::byte *>(attr) + NLA_HDRLEN, kFamilyName.data(), name_len);
+    std::memcpy(reinterpret_cast<std::byte*>(attr) + NLA_HDRLEN, kFamilyName.data(), name_len);
 
     std::vector<std::byte> reply(kReplySize);
-    if (!exchange(request.bytes, reply))
-        return std::nullopt;
+    if (!exchange(request.bytes, reply)) return std::nullopt;
 
-    const auto *header = reinterpret_cast<const nlmsghdr *>(reply.data());
+    const auto* header = reinterpret_cast<const nlmsghdr*>(reply.data());
     for (int left = static_cast<int>(reply.size()); nlmsg_ok(header, left);) {
-        if (header->nlmsg_type == NLMSG_ERROR)
-            break;
+        if (header->nlmsg_type == NLMSG_ERROR) break;
 
-        const auto *genl = reinterpret_cast<const genlmsghdr *>(NLMSG_DATA(header));
+        const auto* genl = reinterpret_cast<const genlmsghdr*>(NLMSG_DATA(header));
         int attr_left = static_cast<int>(header->nlmsg_len) - NLMSG_LENGTH(GENL_HDRLEN);
-        const auto *attr =
-            reinterpret_cast<const nlattr *>(reinterpret_cast<const std::byte *>(genl) + GENL_HDRLEN);
+        const auto* attr =
+            reinterpret_cast<const nlattr*>(reinterpret_cast<const std::byte*>(genl) + GENL_HDRLEN);
         while (nlattr_ok(attr, attr_left)) {
             if (attr->nla_type == CTRL_ATTR_FAMILY_ID) {
                 std::uint16_t id = 0;
-                std::memcpy(&id, reinterpret_cast<const std::byte *>(attr) + NLA_HDRLEN, sizeof(id));
+                std::memcpy(&id, reinterpret_cast<const std::byte*>(attr) + NLA_HDRLEN, sizeof(id));
                 return id;
             }
             attr_left -= static_cast<int>(NLA_ALIGN(attr->nla_len));
@@ -165,8 +158,7 @@ std::optional<std::uint16_t> NetlinkClient::resolve_family() {
 }
 
 bool NetlinkClient::ensure_connected() {
-    if (socket_.valid())
-        return true;
+    if (socket_.valid()) return true;
 
     const int fd = ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_GENERIC);
     if (fd < 0) {
@@ -176,7 +168,7 @@ bool NetlinkClient::ensure_connected() {
 
     sockaddr_nl address{};
     address.nl_family = AF_NETLINK;
-    if (::bind(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0) {
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
         Log::warn("bind: {}", std::strerror(errno));
         ::close(fd);
         return false;
@@ -187,7 +179,7 @@ bool NetlinkClient::ensure_connected() {
      * reply there is nothing to receive, and without one the helper would sit in recvmsg()
      * forever: that is the "cannot connect after rmmod/insmod" symptom.
      */
-    timeval deadline{ .tv_sec = 0, .tv_usec = 500 * 1000 };
+    timeval deadline{.tv_sec = 0, .tv_usec = 500 * 1000};
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline));
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &deadline, sizeof(deadline));
 
@@ -202,8 +194,7 @@ bool NetlinkClient::push(std::span<const Pair> pairs) {
      * instead of the client talking to a dead id for the rest of its life.
      */
     for (int attempt = 0; attempt < 2; ++attempt) {
-        if (send_once(pairs))
-            return true;
+        if (send_once(pairs)) return true;
         family_.reset();
         socket_.reset();
     }
@@ -212,35 +203,33 @@ bool NetlinkClient::push(std::span<const Pair> pairs) {
 }
 
 bool NetlinkClient::send_once(std::span<const Pair> pairs) {
-    if (!ensure_connected())
-        return false;
+    if (!ensure_connected()) return false;
 
     if (!family_) {
         const auto resolved = resolve_family();
-        if (!resolved)
-            return false;
+        if (!resolved) return false;
         family_ = *resolved;
     }
 
     const std::size_t blob_len = sizeof(std::uint32_t) * (1 + 2 * pairs.size());
     Buffer request{};
-    request.bytes.assign(NLMSG_SPACE(GENL_HDRLEN) + NLA_ALIGN(NLA_HDRLEN + blob_len), std::byte{ 0 });
+    request.bytes.assign(NLMSG_SPACE(GENL_HDRLEN) + NLA_ALIGN(NLA_HDRLEN + blob_len), std::byte{0});
 
-    auto *nlh = request.nlmsg();
+    auto* nlh = request.nlmsg();
     nlh->nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN + NLA_HDRLEN + static_cast<int>(blob_len));
     nlh->nlmsg_type = *family_;
     nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
     nlh->nlmsg_seq = ++seq_;
 
-    auto *genl = request.genlmsg();
+    auto* genl = request.genlmsg();
     genl->cmd = kCmdSet;
     genl->version = 1;
 
-    auto *attr = reinterpret_cast<nlattr *>(reinterpret_cast<std::byte *>(genl) + GENL_HDRLEN);
+    auto* attr = reinterpret_cast<nlattr*>(reinterpret_cast<std::byte*>(genl) + GENL_HDRLEN);
     attr->nla_type = kAttrBlob;
     attr->nla_len = NLA_HDRLEN + static_cast<int>(blob_len);
 
-    std::span<std::byte> blob(reinterpret_cast<std::byte *>(attr) + NLA_HDRLEN, blob_len);
+    std::span<std::byte> blob(reinterpret_cast<std::byte*>(attr) + NLA_HDRLEN, blob_len);
     store_u32(blob, 0, static_cast<std::uint32_t>(pairs.size()));
     for (std::size_t i = 0; i < pairs.size(); ++i) {
         store_u32(blob, 4 + 8 * i, pairs[i].caller);
@@ -248,7 +237,7 @@ bool NetlinkClient::send_once(std::span<const Pair> pairs) {
     }
 
     std::vector<std::byte> reply(kReplySize);
-    return exchange(std::span{ request.bytes }.first(nlh->nlmsg_len), reply);
+    return exchange(std::span{request.bytes}.first(nlh->nlmsg_len), reply);
 }
 
 }  // namespace uidfake

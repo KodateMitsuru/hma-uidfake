@@ -12,16 +12,13 @@ namespace uidfake {
 namespace {
 
 std::optional<std::uint32_t> parse_uid(std::string_view text) {
-    if (text.empty() || text.size() > 10)
-        return std::nullopt;
+    if (text.empty() || text.size() > 10) return std::nullopt;
     std::uint64_t value = 0;
     for (const char c : text) {
-        if (c < '0' || c > '9')
-            return std::nullopt;
+        if (c < '0' || c > '9') return std::nullopt;
         value = value * 10 + static_cast<std::uint64_t>(c - '0');
     }
-    if (value == 0 || value >= (1ULL << 31))
-        return std::nullopt;
+    if (value == 0 || value >= (1ULL << 31)) return std::nullopt;
     return static_cast<std::uint32_t>(value);
 }
 
@@ -37,11 +34,10 @@ std::optional<std::uint32_t> parse_uid(std::string_view text) {
  * system app. Apps on shared system uids never reach this check: the policy drops any uid
  * below 10000 by itself.
  */
-std::set<std::string, std::less<>> read_system_apps(const std::filesystem::path &list_path) {
+std::set<std::string, std::less<>> read_system_apps(const std::filesystem::path& list_path) {
     std::set<std::string, std::less<>> result;
     std::ifstream in(list_path);
-    if (!in)
-        return result;
+    if (!in) return result;
 
     /* Set for anything installed on /system, /system_ext, /product or /vendor. */
     constexpr std::string_view kPartitionTag = "partition=";
@@ -49,21 +45,18 @@ std::set<std::string, std::less<>> read_system_apps(const std::filesystem::path 
     while (std::getline(in, line)) {
         std::istringstream fields(line);
         std::string name, uid, debug, data_dir, seinfo;
-        if (!(fields >> name >> uid >> debug >> data_dir >> seinfo))
-            continue;
-        if (seinfo.find(kPartitionTag) != std::string::npos)
-            result.insert(std::move(name));
+        if (!(fields >> name >> uid >> debug >> data_dir >> seinfo)) continue;
+        if (seinfo.find(kPartitionTag) != std::string::npos) result.insert(std::move(name));
     }
     return result;
 }
 
 }  // namespace
 
-std::optional<PackageDb> PackageDb::load(const std::filesystem::path &list_path) {
+std::optional<PackageDb> PackageDb::load(const std::filesystem::path& list_path) {
     PackageDb db;
     std::ifstream in(list_path);
-    if (!in)
-        return std::nullopt;
+    if (!in) return std::nullopt;
 
     std::string line;
     std::size_t malformed = 0;
@@ -81,8 +74,7 @@ std::optional<PackageDb> PackageDb::load(const std::filesystem::path &list_path)
         }
         db.by_name_[std::move(name)] = *value;
     }
-    if (malformed > 0)
-        Log::warn("packages.list: {} unparsable line(s)", malformed);
+    if (malformed > 0) Log::warn("packages.list: {} unparsable line(s)", malformed);
 
     db.system_apps_ = read_system_apps(list_path);
     /* The count only moves when something is installed or removed, so say it when it does:
@@ -103,13 +95,10 @@ std::optional<PackageDb> PackageDb::load(const std::filesystem::path &list_path)
 
 std::optional<std::uint32_t> PackageDb::uid_of(std::string_view name) const {
     const auto it = by_name_.find(name);
-    if (it == by_name_.end())
-        return std::nullopt;
+    if (it == by_name_.end()) return std::nullopt;
     return it->second;
 }
 
-bool PackageDb::is_system(std::string_view name) const {
-    return system_apps_.contains(name);
-}
+bool PackageDb::is_system(std::string_view name) const { return system_apps_.contains(name); }
 
 }  // namespace uidfake

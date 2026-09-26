@@ -30,10 +30,10 @@ static void expect_branch(unsigned long from, unsigned long to)
 int main(void)
 {
 	/* module region is up to 128 MB below the kernel image: the boundary matters */
-	unsigned long img = 0xffff800008000000UL;	/* KIMAGE_VADDR */
+	unsigned long img = 0xffff800008000000UL; /* KIMAGE_VADDR */
 	unsigned long modhi = img - 0x1000;
-	unsigned long modlo = img - 0x07ff0000UL;	/* just inside */
-	unsigned long modout = img - 0x08000000UL;	/* exactly 128 MB: out */
+	unsigned long modlo = img - 0x07ff0000UL;  /* just inside */
+	unsigned long modout = img - 0x08000000UL; /* exactly 128 MB: out */
 	unsigned long i;
 
 	expect_branch(modhi, img);
@@ -52,7 +52,6 @@ int main(void)
 	if ((b & 0xFC000000u) != ARM64_B || (bl & 0xFC000000u) != ARM64_BL ||
 	    (b & 0x03FFFFFFu) != (bl & 0x03FFFFFFu))
 		printf("FAIL: B and BL must share the offset\n"), fails++;
-
 
 	/* the two instructions the patcher relies on */
 	if (arm64_is_bl(0x14000000u) || !arm64_is_bl(0x94000000u))

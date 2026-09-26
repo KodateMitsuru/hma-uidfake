@@ -1,0 +1,7 @@
+# Host test files include kernel-ish headers, so they follow the kernel style.
+BasedOnStyle: LLVM
+IndentWidth: 8
+UseTab: Always
+TabWidth: 8
+ColumnLimit: 100
+BreakBeforeBraces: Linux

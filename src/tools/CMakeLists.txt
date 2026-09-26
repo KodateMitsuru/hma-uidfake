@@ -18,8 +18,16 @@ add_executable(sync-tool
     hma.cpp
     packages.cpp)
 target_link_libraries(sync-tool PRIVATE nlohmann_json::nlohmann_json dl)
+
+
 target_compile_options(sync-tool PRIVATE -O2 -Wall -Wextra)
-target_link_options(sync-tool PRIVATE -static -s)
+# Dynamic on purpose: the unlock trigger resolves __system_property_wait() at run time, which the
+# NDK stubs do not carry, and dlopen() needs a real dynamic loader - with -static the NDK links its
+# libdl.a stub, whose dlopen() always fails. libc++ stays static, so nothing extra ships.
+# Dynamic on purpose: the unlock trigger resolves __system_property_wait() at run time (the NDK
+# stubs do not carry it), and dlopen() needs a real dynamic loader - with -static the NDK links its
+# libdl.a stub, whose dlopen() always fails. libc++ stays static, so nothing extra ships.
+target_link_options(sync-tool PRIVATE -s)
 
 # Cross compiling with the NDK: CMake filters the package's /usr/include out as an
 # implicit directory, and the NDK's clang does not search the host /usr/include

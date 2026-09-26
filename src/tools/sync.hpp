@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -18,14 +19,14 @@ struct Config {
 };
 
 /* Prints the usage line to stderr and returns nullopt on a bad command line. */
-[[nodiscard]] std::optional<Config> parse_args(int argc, char **argv);
+[[nodiscard]] std::optional<Config> parse_args(int argc, char** argv);
 
 /*
  * Ties everything together: evaluate HMA's rules against the package database and hand
  * the result to the kernel. One process, no helper binaries, no temporary files.
  */
 class Syncer {
-public:
+   public:
     explicit Syncer(Config config) : config_(std::move(config)) {}
 
     /* Parses and pushes once; failures are logged, never fatal. */
@@ -34,7 +35,7 @@ public:
     /* Syncs once, then keeps following the files until it is killed. */
     [[nodiscard]] bool run();
 
-private:
+   private:
     Config config_;
     bool config_refused_ = false;
     NetlinkClient netlink_;

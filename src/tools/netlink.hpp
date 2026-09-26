@@ -18,18 +18,19 @@ namespace uidfake {
  * never travels over a path an app could read.
  */
 class NetlinkClient {
-public:
+   public:
     NetlinkClient() = default;
 
-    NetlinkClient(const NetlinkClient &) = delete;
-    NetlinkClient &operator=(const NetlinkClient &) = delete;
+    NetlinkClient(const NetlinkClient&) = delete;
+    NetlinkClient& operator=(const NetlinkClient&) = delete;
 
     /* Replaces the kernel's policy with `pairs` (an empty list clears it).
      * Failures are logged; false means the kernel side is not reachable yet. */
     [[nodiscard]] bool push(std::span<const Pair> pairs);
 
-private:
+   private:
     static constexpr std::string_view kFamilyName = "kaux";
+    /* Must match the enum in src/netlink.c: UNSPEC, SET, PING. */
     static constexpr std::uint8_t kCmdSet = 1;
     static constexpr std::uint16_t kAttrBlob = 1;
     static constexpr std::size_t kReplySize = 4096;
@@ -41,7 +42,7 @@ private:
 
     Fd socket_;
     std::optional<std::uint16_t> family_;
-    std::uint32_t seq_ = 0;   /* one per request; replies are matched against it */
+    std::uint32_t seq_ = 0; /* one per request; replies are matched against it */
 };
 
 }  // namespace uidfake

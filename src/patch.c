@@ -11,20 +11,17 @@
  * The technique is the one every out-of-tree patcher on arm64 ends up using; this is an
  * independent implementation.
  */
+#include <asm/cacheflush.h>
+#include <asm/pgtable.h>
 #include <linux/kprobes.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/stop_machine.h>
 #include <linux/vmalloc.h>
-#include <asm/cacheflush.h>
-#include <asm/pgtable.h>
 
 #include "uidfake.h"
 
-static int probe_noop(struct kprobe *p, struct pt_regs *r)
-{
-	return 0;
-}
+static int probe_noop(struct kprobe *p, struct pt_regs *r) { return 0; }
 
 /*
  * Look up a kernel symbol by name. kallsyms_lookup_name() is not exported to modules, so its
@@ -34,7 +31,7 @@ static int probe_noop(struct kprobe *p, struct pt_regs *r)
  */
 unsigned long uidfake_lookup(const char *name)
 {
-	struct kprobe kp = { .symbol_name = "kallsyms_lookup_name", .pre_handler = probe_noop };
+	struct kprobe kp = {.symbol_name = "kallsyms_lookup_name", .pre_handler = probe_noop};
 	unsigned long (*fn)(const char *);
 
 	if (register_kprobe(&kp))
@@ -58,8 +55,8 @@ int uidfake_patch_init(void)
 	patch_mm = (struct mm_struct *)uidfake_lookup("init_mm");
 	g_kimage_voffset = (unsigned long *)uidfake_lookup("kimage_voffset");
 	g_memstart_addr = (unsigned long *)uidfake_lookup("memstart_addr");
-	pr_info("uidfake: init_mm=%px kimage_voffset=%px memstart_addr=%px\n",
-		patch_mm, (void *)g_kimage_voffset, (void *)g_memstart_addr);
+	pr_info("uidfake: init_mm=%px kimage_voffset=%px memstart_addr=%px\n", patch_mm,
+		(void *)g_kimage_voffset, (void *)g_memstart_addr);
 	return patch_mm ? 0 : -ENOENT;
 }
 struct patch_req {
@@ -137,10 +134,10 @@ static void cache_clean_inval(void *addr, size_t len)
 	unsigned long p;
 
 	for (p = start & ~(dline - 1); p < end; p += dline)
-		asm volatile("dc cvau, %0" :: "r"(p) : "memory");
+		asm volatile("dc cvau, %0" ::"r"(p) : "memory");
 	dsb(ish);
 	for (p = start & ~(iline - 1); p < end; p += iline)
-		asm volatile("ic ivau, %0" :: "r"(p) : "memory");
+		asm volatile("ic ivau, %0" ::"r"(p) : "memory");
 	dsb(ish);
 	isb();
 }
@@ -172,7 +169,8 @@ static struct page *page_for(unsigned long addr, unsigned long *off)
 		return NULL;
 	if (!g_walk_warned) {
 		g_walk_warned = true;
-		pr_info("uidfake: page table walk unusable (vendor mm_struct); using kimage_voffset\n");
+		pr_info(
+		    "uidfake: page table walk unusable (vendor mm_struct); using kimage_voffset\n");
 	}
 	return pfn_to_page(phys >> PAGE_SHIFT);
 }
@@ -201,7 +199,7 @@ static int patch_do(void *arg)
 
 int uidfake_patch_text(void *dst, const void *src, size_t len, bool sync)
 {
-	struct patch_req req = { .addr = dst, .src = src, .len = len };
+	struct patch_req req = {.addr = dst, .src = src, .len = len};
 	int ret;
 
 	if (!len || (unsigned long)dst & 3 || len & 3)
