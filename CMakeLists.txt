@@ -33,14 +33,73 @@ if(NOT UG_NDK)
 endif()
 
 # module id / version come from module/module.prop
+# The version git reports: <tag without its v> + the short hash, e.g. 0.1.0+a77bea6. module.prop
+# carries only the fallback, for a source tree without git (a release tarball).
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/module/module.prop" _prop)
 foreach(_l IN LISTS _prop)
   if(_l MATCHES "^id=(.+)$")
     set(UG_ID "${CMAKE_MATCH_1}")
   elseif(_l MATCHES "^version=(.+)$")
-    set(UG_VER "${CMAKE_MATCH_1}")
+    set(UG_BASE "${CMAKE_MATCH_1}")
+  elseif(_l MATCHES "^versionCode=(.+)$")
+    set(UG_BASE_CODE "${CMAKE_MATCH_1}")
   endif()
 endforeach()
+
+function(ug_git out)
+  execute_process(COMMAND git -C "${CMAKE_CURRENT_SOURCE_DIR}" ${ARGN}
+                  OUTPUT_VARIABLE _out OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
+                  RESULT_VARIABLE _rc)
+  if(_rc EQUAL 0)
+    set(${out} "${_out}" PARENT_SCOPE)
+  endif()
+endfunction()
+
+ug_git(_tag describe --tags --abbrev=0)
+ug_git(_hash rev-parse --short HEAD)
+if(_tag)
+  string(REGEX REPLACE "^v" "" _tag "${_tag}")
+else()
+  set(_tag "${UG_BASE}")
+endif()
+if(_hash)
+  ug_git(_dirty status --porcelain)
+  if(_dirty)
+    set(_hash "${_hash}-dirty")
+  endif()
+  set(UG_VER "${_tag}+${_hash}")
+else()
+  set(UG_VER "${_tag}")
+endif()
+
+# versionCode has to be a number and has to grow: it is the tag as
+# major * 1000000 + minor * 1000 + patch, so 0.1.0 is 1000 and a new tag is the only thing that
+# raises it. A tag that is not x.y.z falls back to the value module.prop carries.
+if(_tag MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
+  math(EXPR UG_VERCODE "${CMAKE_MATCH_1} * 1000000 + ${CMAKE_MATCH_2} * 1000 + ${CMAKE_MATCH_3}")
+else()
+  set(UG_VERCODE "${UG_BASE_CODE}")
+endif()
+
+# A commit on the checked-out branch has to re-run this, or the version would be stale.
+foreach(_ref ".git/HEAD" ".git/packed-refs")
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_ref}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${_ref}")
+  endif()
+endforeach()
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/.git/HEAD" _head)
+if(_head MATCHES "^ref: (.+)$")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+               "${CMAKE_CURRENT_SOURCE_DIR}/.git/${CMAKE_MATCH_1}")
+endif()
+
+# The module.prop that gets installed carries the version the module manager shows.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/module/module.prop" _prop_text)
+# By value, not by line anchor: file(READ) hands over the whole file and CMake's ^ matches only
+# the start of that string.
+string(REPLACE "version=${UG_BASE}" "version=${UG_VER}" _prop_text "${_prop_text}")
+string(REPLACE "versionCode=${UG_BASE_CODE}" "versionCode=${UG_VERCODE}" _prop_text "${_prop_text}")
+file(WRITE "${CMAKE_BINARY_DIR}/module.prop" "${_prop_text}")
 set(KO_NAME hma_uidfake)
 
 set(KO_DIR "${CMAKE_BINARY_DIR}/ko")
@@ -133,6 +192,7 @@ add_custom_command(OUTPUT "${UG_STAGE}/.stamp"
   COMMAND ${CMAKE_COMMAND} -E rm -rf "${UG_STAGE}"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${UG_STAGE}/ko"
   COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/module" "${UG_STAGE}"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_BINARY_DIR}/module.prop" "${UG_STAGE}/module.prop"
   COMMAND ${CMAKE_COMMAND} -E copy_directory "${KO_DIR}" "${UG_STAGE}/ko"
   COMMAND ${CMAKE_COMMAND} -E copy "${UG_SYNC}" "${UG_STAGE}/sync-tool"
   COMMAND ${CMAKE_COMMAND} -E touch "${UG_STAGE}/.stamp"

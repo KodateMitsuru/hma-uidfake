@@ -29,6 +29,9 @@ jobs:
           - android17-6.18
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The module version comes from git (tag + short hash), so the tags have to be here.
+          fetch-depth: 0
       - name: Build
         run: |
           set -euo pipefail
@@ -58,6 +61,8 @@ jobs:
     needs: lkm
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           path: build/ko
@@ -109,7 +114,28 @@ jobs:
         with:
           name: module-zip
           path: dist
+      - name: Write update.json
+        run: |
+          set -euo pipefail
+          zip=$(ls dist/*.zip)
+          # The packed module.prop already carries what this build computed, so the JSON cannot
+          # disagree with the module it describes.
+          version=$(unzip -p "$zip" module.prop | sed -n 's/^version=//p')
+          code=$(unzip -p "$zip" module.prop | sed -n 's/^versionCode=//p')
+          tag="${{ github.ref_name }}"
+          asset=$(basename "$zip")
+          cat > dist/update.json <<JSON
+          {
+            "version": "$version",
+            "versionCode": $code,
+            "zipUrl": "https://github.com/${{ github.repository }}/releases/download/$tag/$asset",
+            "changelog": "https://github.com/${{ github.repository }}/releases/tag/$tag"
+          }
+          JSON
+          cat dist/update.json
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.zip
+          files: dist/*
           generate_release_notes: true
+      # module.prop points updateJson at releases/latest/download/update.json, so it is this
+      # asset -- not a file in the repository -- that the module manager reads.
