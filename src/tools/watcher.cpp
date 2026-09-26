@@ -34,29 +34,39 @@ constexpr std::string_view kPackagesPrefix = "packages.";
  * nothing to watch and nothing readable anyway - block on the property itself instead of
  * waking up every second. Returns whether the storage is open now.
  */
-using PropWait = int (*)(const prop_info*, std::uint32_t, std::uint32_t*, const timespec*);
+/*
+ * The unlock is a key being added and a bind mount being made: inotify reports neither. The
+ * platform's own waiting call is not part of the NDK's symbols, so it and the serial accessor
+ * that closes the gap between looking at the flag and waiting on it are resolved at run time.
+ * If a ROM lacks either, the flag is polled instead and nothing else notices.
+ */
+using PropSerial = std::uint32_t (*)(const prop_info*);
+using PropWait = bool (*)(const prop_info*, std::uint32_t, std::uint32_t*, const timespec*);
+
+constexpr int kUnlockPollMs = 250;
 
 [[nodiscard]] bool wait_for_unlock() {
     if (ce_available()) return true;
 
-    /*
-     * __system_property_wait() is exported by the platform libc but not by the NDK stubs, so it
-     * is resolved at run time; a 5 s slice only matters if the property never changes at all.
-     */
-    static const auto wait_fn =
-        reinterpret_cast<PropWait>(::dlsym(RTLD_DEFAULT, "__system_property_wait"));
     const prop_info* info = __system_property_find("sys.user.0.ce_available");
-    constexpr int kSliceSeconds = 5;
+    const auto serial_fn =
+        reinterpret_cast<PropSerial>(dlsym(RTLD_DEFAULT, "__system_property_serial"));
+    const auto wait_fn = reinterpret_cast<PropWait>(dlsym(RTLD_DEFAULT, "__system_property_wait"));
 
-    if (wait_fn && info) {
-        const std::uint32_t serial = __system_property_serial(info);
-        std::uint32_t fresh = serial;
-        timespec slice{.tv_sec = kSliceSeconds, .tv_nsec = 0};
-        wait_fn(info, serial, &fresh, &slice);
-    } else {
-        ::sleep(kSliceSeconds);
+    if (info != nullptr && serial_fn != nullptr && wait_fn != nullptr) {
+        std::uint32_t seen = serial_fn(info);
+        while (!ce_available()) {
+            std::uint32_t fresh = 0;
+            timespec watchdog{.tv_sec = 30, .tv_nsec = 0};
+            if (!wait_fn(info, seen, &fresh, &watchdog)) continue;
+            seen = fresh;
+        }
+        return true;
     }
-    return ce_available();
+
+    timespec slice{.tv_sec = 0, .tv_nsec = kUnlockPollMs * 1000 * 1000};
+    while (!ce_available()) ::nanosleep(&slice, nullptr);
+    return true;
 }
 
 constexpr std::uint32_t kFileEvents =
