@@ -852,10 +852,13 @@ static __always_inline u32 policy_lookup_core(uid_t target, u32 app)
  * at all rather than an identity derived from a uid that anything could have changed.
  */
 /*
- * The apk inodes of the apps that have rules. The helper reads package names and pushes the
- * inode of each of their apks; the kernel only ever compares numbers. The table is consulted
- * only while an isolated child is still being named -- which is on the open path -- so the lookup
- * is hashed: a handful of probes whatever the table holds.
+ * The apk inodes of the apps that have rules. The helper reads package names and pushes the inode
+ * of each of their apks; the kernel only ever compares numbers.
+ *
+ * The table is consulted on the open path while an isolated child is being named, so it is written
+ * into one of two buffers and published by index: the writer holds the lock, readers only take an
+ * acquire load and never disable interrupts. The buffers are static and never freed, so nothing
+ * has to wait for a grace period.
  */
 struct uf_apk { /* 16 bytes */
 	u32 dev;
@@ -864,13 +867,14 @@ struct uf_apk { /* 16 bytes */
 	u32 tag; /* 0 marks an empty slot */
 };
 
-#define UF_APK_SLOTS 2048u /* power of two */
+#define UF_APK_SLOTS 1024u /* power of two, two buffers */
 #define UF_APK_PROBE 8u
 
+static struct uf_apk g_apk_tab[2][UF_APK_SLOTS];
+static u16 g_apk_used[2][UF_APK_MAX]; /* slots to clear when a buffer is filled again */
+static u32 g_apk_used_n[2];
+static u32 g_apk_cur; /* published buffer, written under the lock, read without it */
 static DEFINE_SPINLOCK(g_apk_lock);
-static struct uf_apk g_apks[UF_APK_SLOTS];
-static u16 g_apk_used[UF_APK_MAX]; /* slots to clear on the next apply */
-static u32 g_apk_used_n;
 
 static u32 uf_apk_bucket(u32 dev, u32 lo, u32 hi)
 {
@@ -883,15 +887,18 @@ static u32 uf_apk_bucket(u32 dev, u32 lo, u32 hi)
 
 int uidfake_apk_apply(const u32 *blob, u32 n)
 {
-	unsigned long flags;
-	u32 i, kept = 0, inserted = 0;
+	u32 i, kept = 0, inserted = 0, next;
+	u16 *used;
+	struct uf_apk *tab;
 
 	if (n > UF_APK_MAX)
 		return -EINVAL;
-	spin_lock_irqsave(&g_apk_lock, flags);
-	for (i = 0; i < g_apk_used_n; i++)
-		g_apks[g_apk_used[i]].tag = 0;
-	g_apk_used_n = 0;
+	spin_lock(&g_apk_lock);
+	next = g_apk_cur ^ 1u;
+	tab = g_apk_tab[next];
+	used = g_apk_used[next];
+	for (i = 0; i < g_apk_used_n[next]; i++)
+		tab[used[i]].tag = 0;
 	for (i = 0; i < n; i++) {
 		/* 16 bytes per entry, in this order: st_dev, ino_lo, ino_hi, uid. */
 		const u32 *e = &blob[i * 4u];
@@ -904,20 +911,21 @@ int uidfake_apk_apply(const u32 *blob, u32 n)
 		slot = uf_apk_bucket(e[0], e[1], e[2]);
 		for (probe = 0; probe < UF_APK_PROBE; probe++) {
 			const u32 at = (slot + probe) & (UF_APK_SLOTS - 1u);
-			struct uf_apk *dst = &g_apks[at];
 
-			if (dst->tag)
+			if (tab[at].tag)
 				continue;
-			dst->dev = e[0];
-			dst->ino_lo = e[1];
-			dst->ino_hi = e[2];
-			dst->tag = app - UF_APP_MIN + 1u;
-			g_apk_used[inserted++] = (u16)at;
+			tab[at].dev = e[0];
+			tab[at].ino_lo = e[1];
+			tab[at].ino_hi = e[2];
+			tab[at].tag = app - UF_APP_MIN + 1u;
+			used[inserted++] = (u16)at;
 			break;
 		}
 	}
-	g_apk_used_n = inserted;
-	spin_unlock_irqrestore(&g_apk_lock, flags);
+	g_apk_used_n[next] = inserted;
+	/* Readers pick this up with an acquire load; everything above is visible with it. */
+	smp_store_release(&g_apk_cur, next);
+	spin_unlock(&g_apk_lock);
 	pr_info("uidfake: %u of %u caller apk inode(s) known\n", inserted, kept);
 	return 0;
 }
@@ -932,23 +940,19 @@ u32 uidfake_apk_lookup(dev_t s_dev, u64 ino)
 	const u32 minor = (u32)s_dev & 0xfffffu;
 	const u32 dev = (minor & 0xffu) | (major << 8) | ((minor & ~0xffu) << 12);
 	const u32 lo = (u32)ino, hi = (u32)(ino >> 32);
-	unsigned long flags;
-	u32 slot, probe, tag = 0;
+	const struct uf_apk *tab = g_apk_tab[smp_load_acquire(&g_apk_cur)];
+	u32 slot, probe;
 
-	spin_lock_irqsave(&g_apk_lock, flags);
 	slot = uf_apk_bucket(dev, lo, hi);
 	for (probe = 0; probe < UF_APK_PROBE; probe++) {
-		const struct uf_apk *e = &g_apks[(slot + probe) & (UF_APK_SLOTS - 1u)];
+		const struct uf_apk *e = &tab[(slot + probe) & (UF_APK_SLOTS - 1u)];
 
 		if (!e->tag)
 			break;
-		if (e->dev == dev && e->ino_lo == lo && e->ino_hi == hi) {
-			tag = e->tag;
-			break;
-		}
+		if (e->dev == dev && e->ino_lo == lo && e->ino_hi == hi)
+			return e->tag;
 	}
-	spin_unlock_irqrestore(&g_apk_lock, flags);
-	return tag;
+	return 0;
 }
 
 /* true while an isolated child is still waiting for the apk that names it */

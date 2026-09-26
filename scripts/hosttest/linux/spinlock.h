@@ -6,6 +6,14 @@ typedef struct {
 	int locked;
 } spinlock_t;
 #define DEFINE_SPINLOCK(x) spinlock_t x = {0}
+#define spin_lock(l)                                                                               \
+	do {                                                                                       \
+		(void)(l);                                                                         \
+	} while (0)
+#define spin_unlock(l)                                                                             \
+	do {                                                                                       \
+		(void)(l);                                                                         \
+	} while (0)
 #define spin_lock_irqsave(l, f)                                                                    \
 	do {                                                                                       \
 		(void)(l);                                                                         \

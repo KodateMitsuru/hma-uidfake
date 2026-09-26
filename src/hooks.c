@@ -5,6 +5,7 @@
 #include <linux/ioprio.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/version.h>
 
 #include <linux/module.h>
 #include <linux/resource.h>
@@ -223,10 +224,9 @@ static struct uf_iso_slot g_iso[UF_ISO_SLOTS];
 static void uidfake_iso_arm(void)
 {
 	const s32 pid = task_tgid_nr(current); /* the whole process shares one window */
-	unsigned long flags;
 	u32 i, slot = UF_ISO_SLOTS;
 
-	spin_lock_irqsave(&g_iso_lock, flags);
+	spin_lock(&g_iso_lock);
 	for (i = 0; i < UF_ISO_SLOTS; i++) {
 		if (g_iso[i].tgid == pid || g_iso[i].tgid == 0) {
 			slot = i;
@@ -238,32 +238,30 @@ static void uidfake_iso_arm(void)
 	g_iso[slot].tgid = pid;
 	g_iso[slot].opens = 0;
 	g_iso[slot].exp = jiffies + msecs_to_jiffies(UF_ISO_MS);
-	spin_unlock_irqrestore(&g_iso_lock, flags);
+	spin_unlock(&g_iso_lock);
 }
 
 static void uidfake_iso_done(void)
 {
 	const s32 pid = task_tgid_nr(current); /* the whole process shares one window */
-	unsigned long flags;
 	u32 i;
 
-	spin_lock_irqsave(&g_iso_lock, flags);
+	spin_lock(&g_iso_lock);
 	for (i = 0; i < UF_ISO_SLOTS; i++) {
 		if (g_iso[i].tgid == pid)
 			g_iso[i].tgid = 0;
 	}
-	spin_unlock_irqrestore(&g_iso_lock, flags);
+	spin_unlock(&g_iso_lock);
 }
 
 /* True once this task should stop looking: the window closed, or never opened. */
 static bool uidfake_iso_window_over(void)
 {
 	const s32 pid = task_tgid_nr(current); /* the whole process shares one window */
-	unsigned long flags;
 	bool over = true;
 	u32 i;
 
-	spin_lock_irqsave(&g_iso_lock, flags);
+	spin_lock(&g_iso_lock);
 	for (i = 0; i < UF_ISO_SLOTS; i++) {
 		if (g_iso[i].tgid != pid)
 			continue;
@@ -274,7 +272,7 @@ static bool uidfake_iso_window_over(void)
 			over = false;
 		break;
 	}
-	spin_unlock_irqrestore(&g_iso_lock, flags);
+	spin_unlock(&g_iso_lock);
 	return over;
 }
 
@@ -336,6 +334,7 @@ static void uidfake_resolve_fd(int fd, const char *what)
 {
 	struct inode *inode;
 	struct file *file;
+	struct fd f;
 	u32 tag;
 
 	(void)what;
@@ -345,12 +344,21 @@ static void uidfake_resolve_fd(int fd, const char *what)
 		uidfake_tag_close();
 		return;
 	}
-	file = fget(fd);
+	/*
+	 * fdget keeps the file alive without the atomic a counted lookup would cost. 6.12 made the
+	 * member private behind fd_file(), so the access is spelled per version.
+	 */
+	f = fdget(fd);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+	file = fd_file(f);
+#else
+	file = f.file;
+#endif
 	if (!file)
 		return;
 	inode = file_inode(file);
 	tag = uidfake_apk_lookup(inode->i_sb->s_dev, (u64)inode->i_ino);
-	fput(file);
+	fdput(f);
 	if (tag)
 		uidfake_tag_verify(tag);
 }

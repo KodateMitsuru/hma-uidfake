@@ -67,7 +67,7 @@ u32 policy_lookup_as(uid_t caller, uid_t target);
  */
 #define UF_TAG_PENDING (1UL << 55)
 
-#define UF_APK_MAX 1024 /* caller apk inodes the kernel knows, pushed by the helper */
+#define UF_APK_MAX 512 /* caller apk inodes the kernel knows, pushed by the helper */
 
 u32 uidfake_tag_app(void);		       /* app id + 1, or 0 when untagged */
 int uidfake_apk_apply(const u32 *blob, u32 n); /* n * (st_dev, ino_lo, ino_hi, uid) */
