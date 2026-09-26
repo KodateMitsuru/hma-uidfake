@@ -678,8 +678,10 @@ void uidfake_tag_prime(void)
 
 				if (!((flags >> UF_TAG_SHIFT) & UF_TAG_MASK))
 					WRITE_ONCE(task_thread_info(thread)->flags,
-						   flags | ((unsigned long)(id - UF_APP_MIN + 1u)
-							    << UF_TAG_SHIFT));
+						   (flags & ~((UF_TAG_MASK << UF_TAG_SHIFT) |
+							      UF_TAG_PENDING)) |
+						       ((unsigned long)(id - UF_APP_MIN + 1u)
+							<< UF_TAG_SHIFT));
 				primed++;
 			}
 			put_cred(cred);
@@ -712,10 +714,9 @@ void uidfake_tag_note(u32 before_sid, u32 after_sid, u32 old_uid, u32 new_uid)
 		const unsigned long flags = READ_ONCE(task_thread_info(current)->flags);
 		const unsigned long cur = (flags >> UF_TAG_SHIFT) & UF_TAG_MASK;
 
-		if (!cur || (cur & UF_TAG_UNVERIFIED)) {
+		if (!cur || (cur & UF_TAG_PENDING)) {
 			WRITE_ONCE(task_thread_info(current)->flags,
-				   (flags & ~(UF_TAG_MASK << UF_TAG_SHIFT)) |
-				       (UF_TAG_UNVERIFIED << UF_TAG_SHIFT));
+				   (flags & ~(UF_TAG_MASK << UF_TAG_SHIFT)) | UF_TAG_PENDING);
 			pr_info("uidfake: iso birth uid %u marked, awaiting the apk it opens\n",
 				new_uid);
 		}
@@ -737,9 +738,7 @@ void uidfake_tag_note(u32 before_sid, u32 after_sid, u32 old_uid, u32 new_uid)
 
 u32 uidfake_tag_app(void)
 {
-	/* The verification bit is bookkeeping, not part of the identity. */
-	return (u32)((task_thread_info(current)->flags >> UF_TAG_SHIFT) & UF_TAG_MASK) &
-	       ~(u32)UF_TAG_UNVERIFIED;
+	return (u32)((task_thread_info(current)->flags >> UF_TAG_SHIFT) & UF_TAG_MASK);
 }
 
 void uidfake_tag_adopt(u32 old_uid, u32 new_uid)
@@ -757,7 +756,8 @@ void uidfake_tag_adopt(u32 old_uid, u32 new_uid)
 	if (app >= UF_APP_SPAN)
 		return;
 	WRITE_ONCE(task_thread_info(current)->flags,
-		   flags | ((unsigned long)(app + 1) << UF_TAG_SHIFT));
+		   (flags & ~((UF_TAG_MASK << UF_TAG_SHIFT) | UF_TAG_PENDING)) |
+		       ((unsigned long)(app + 1) << UF_TAG_SHIFT));
 }
 
 /*
@@ -954,8 +954,7 @@ u32 uidfake_apk_lookup(dev_t s_dev, u64 ino)
 /* true while an isolated child is still waiting for the apk that names it */
 static bool uidfake_tag_pending_here(void)
 {
-	return (((task_thread_info(current)->flags >> UF_TAG_SHIFT) & UF_TAG_MASK) &
-		UF_TAG_UNVERIFIED) != 0;
+	return (READ_ONCE(task_thread_info(current)->flags) & UF_TAG_PENDING) != 0;
 }
 
 u32 policy_lookup(uid_t caller, uid_t target)

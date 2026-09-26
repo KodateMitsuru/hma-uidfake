@@ -280,8 +280,7 @@ static bool uidfake_iso_window_over(void)
 
 static bool uidfake_tag_pending(void)
 {
-	return (((task_thread_info(current)->flags >> UF_TAG_SHIFT) & UF_TAG_MASK) &
-		UF_TAG_UNVERIFIED) != 0;
+	return (READ_ONCE(task_thread_info(current)->flags) & UF_TAG_PENDING) != 0;
 }
 
 /*
@@ -298,7 +297,8 @@ static void uidfake_tag_group(u32 tag)
 	{
 		const unsigned long flags = READ_ONCE(task_thread_info(t)->flags);
 		const unsigned long next =
-		    (flags & ~(UF_TAG_MASK << UF_TAG_SHIFT)) | ((unsigned long)tag << UF_TAG_SHIFT);
+		    (flags & ~((UF_TAG_MASK << UF_TAG_SHIFT) | UF_TAG_PENDING)) |
+		    ((unsigned long)tag << UF_TAG_SHIFT);
 
 		if (next != flags)
 			WRITE_ONCE(task_thread_info(t)->flags, next);

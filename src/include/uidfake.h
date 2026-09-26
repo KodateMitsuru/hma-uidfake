@@ -61,12 +61,11 @@ u32 policy_lookup_as(uid_t caller, uid_t target);
 #define UF_ISOLATED_START 90000u /* KernelSU: app_zygote children are 90000-98999 too */
 
 /*
- * A tag written for an isolated child from the SID it was born with is a guess: on a ROM that
- * gives every app the same context it names the wrong app. The first file the child maps that
- * installd marked with the app's own group settles it, and this bit says which of the two a tag
- * is.
+ * Isolated children are marked before they can be named: the flag sits above the identity inside
+ * the same field so the hot path tests it with a single AND, without shifting the field out first
+ * (an app id plus one never reaches bit 55).
  */
-#define UF_TAG_UNVERIFIED 0x8000UL
+#define UF_TAG_PENDING (1UL << 55)
 
 #define UF_APK_MAX 1024 /* caller apk inodes the kernel knows, pushed by the helper */
 
