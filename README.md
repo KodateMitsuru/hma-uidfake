@@ -199,10 +199,35 @@ tree itself is never written to.
 
 ### KMI matrix
 
-| KMI | status |
-|---|---|
-| android13-5.10, android13-5.15, android14-5.15, android14-6.1, android15-6.6, android16-6.12, android17-6.18 | built |
-| android12-5.10 | not built: that kernel tree uses GCC global register variables and `"Q"` constraints, which clang rejects |
+One row per KMI, with the clang the DDK pairs with it; `/opt/ddk/kdir/<kmi>` is used as is. Each is
+built by the compiler its kernel was built with, which is also the one clang CFI and the shadow
+call stack came from -- mixing compilers here is not an option (`CONFIG_CFI_CLANG` and
+`CONFIG_SHADOW_CALL_STACK` are both on).
+
+| KMI | kernel | DDK clang |
+|---|---|---|
+| android12-5.10 | 5.10 | clang-r416183b |
+| android13-5.10 | 5.10 | clang-r450784e |
+| android13-5.15 | 5.15 | clang-r450784e |
+| android14-5.15 | 5.15 | clang-r487747c |
+| android14-6.1 | 6.1 | clang-r487747c |
+| android15-6.6 | 6.6 | clang-r510928 |
+| android16-6.12 | 6.12 | clang-r536225 |
+| android17-6.18 | 6.18 | clang-r584948c |
+
+`android12-5.10` is the tree that needed two fixes, both in `src/include/kmi_compat.h`: it declares
+the stack pointer as a GCC style global register variable and writes one breakpoint with a GCC only
+constraint, and clang refuses both outright
+
+    arch/arm64/include/asm/stack_pointer.h:8:51: error: register 'sp' unsuitable for global
+    register variables on this target
+
+The header is therefore skipped through its own guard where it would be parsed, and the same code is
+given in the shape clang accepts (an inline asm helper for the stack pointer, a plain immediate for
+the breakpoint). The other half of that tree is that it takes its target triple from
+`CROSS_COMPILE`, which the LLVM flow leaves unset: without it clang emits bitcode for the host and
+the LTO link fails with "incompatible with aarch64elf". The build passes
+`CROSS_COMPILE=aarch64-linux-gnu-` for that reason.
 
 ## Install
 
@@ -213,6 +238,12 @@ module.prop  customize.sh  post-fs-data.sh  service.sh  README.md
 sync-tool
 ko/<kmi>_arm64_hma_uidfake.ko     customize.sh picks one via uname -r
 ```
+
+`customize.sh` picks the module by `uname -r`: it reads the branch (`android14`) and the kernel
+version (`6.1`) out of the string and asks for `android14-6.1`. The branch is what decides between
+two KMIs that share a kernel version (`android13-5.15` and `android14-5.15`); a device on a branch
+this build has no module for gets a "No matching ... ko" message rather than a module built against
+another kernel, which the kernel would refuse to load anyway.
 
 `post-fs-data.sh` loads the module with `/data/adb/ksud insmod`; `service.sh` starts
 `sync-tool`, which keeps the policy in sync from then on. `sync-tool` appends to
@@ -236,6 +267,7 @@ cc -O1 -I src -I scripts/hosttest -I src/include \
    -o build/branch_encode_test scripts/branch_encode_test.c && ./build/branch_encode_test
 python3 scripts/lookup_model.py     # addresses and load counts per query
 bash scripts/check-undefined.sh     # every undefined symbol is exported by that KMI
+bash scripts/test-kmi-map.sh        # uname -r -> KMI, and whether the zip carries it
 ```
 
 The first two compile the real sources, so they catch C-level mistakes a model cannot see (word
@@ -247,6 +279,16 @@ touches, and how many, as a function of `(caller, target)` alone, never of the p
 would have caught the real bug that shipped once: `__builtin___clear_cache()` lowered to
 `__clear_cache()`, which is not exported, and the module then refused to load with
 `Unknown symbol __clear_cache`.
+
+Formatting and static analysis follow the same split as the code: the module and the test
+sources are formatted by the kernel's own rules (their `.clang-format` is the kernel tree's file),
+the userspace helper by LLVM's, and clang-tidy runs over both -- the kernel half with the flags
+kbuild really compiled with, taken from its own `.cmd` files.
+
+```bash
+clang-format -i --style=file $(find src scripts -name '*.[ch]' -o -name '*.hpp' -o -name '*.cpp')
+bash scripts/run-clang-tidy.sh
+```
 
 For the timing side channel there is `src/tools/uidbench.c`, which is not part of the build.
 Cross-compile it and run it as an app uid that hides:
